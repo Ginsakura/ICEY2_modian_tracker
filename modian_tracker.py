@@ -38,7 +38,7 @@ def fetch_tier_data():
     tier_dict = {}
 
     # 定位包含“已支持 ... 份”的文本节点
-    support_elements = soup.find_all(text=re.compile(r"已支持\s*\d+\s*份"))
+    support_elements = soup.find_all(string=re.compile(r"已支持\s*\d+\s*份"))
 
     level = 1
     for elem in support_elements:
