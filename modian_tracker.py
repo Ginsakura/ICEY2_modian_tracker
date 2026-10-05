@@ -91,6 +91,12 @@ def fetch_tier_data():
     return tier_dict, total_count, total_money
 
 
+def normalize_int_columns(df):
+    """将人数类列（除时间戳与总金额外）转为可空整数，避免写出 .0 后缀"""
+    int_cols = [c for c in df.columns if c not in ("timestamp", "总金额")]
+    return df.astype({c: "Int64" for c in int_cols})
+
+
 def append_to_csv(data, total_count, total_money):
     """带时间戳追加到 CSV 文件"""
     if not data:
@@ -105,9 +111,9 @@ def append_to_csv(data, total_count, total_money):
         existing_df = pd.read_csv(CSV_FILE)
         # 合并历史数据与新列（宽表对齐）
         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-        combined_df.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
+        normalize_int_columns(combined_df).to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
     else:
-        new_df.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
+        normalize_int_columns(new_df).to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
 
     logging.info("成功记录 %d 个档位数据至 %s", len(data), CSV_FILE)
 

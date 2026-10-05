@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     在后台静默循环抓取摩点众筹数据
 .DESCRIPTION
