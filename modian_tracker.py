@@ -13,8 +13,6 @@ import os
 import re
 import time
 from datetime import datetime
-import matplotlib.dates as mdates
-import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -128,6 +126,10 @@ def plot_trends():
     if df.empty or "timestamp" not in df.columns:
         print("CSV 文件为空或未包含有效时间戳列。")
         return
+
+    # 仅在绘图时需要 matplotlib，因此在此处按需导入
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
 
     # 中文字体设置
     plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "PingFang SC", "sans-serif"]
