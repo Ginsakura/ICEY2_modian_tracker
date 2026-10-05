@@ -8,8 +8,10 @@
 # ]
 # ///
 import argparse
+import logging
 import os
 import re
+import time
 from datetime import datetime
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -19,6 +21,7 @@ from bs4 import BeautifulSoup
 
 URL = "https://zhongchou.modian.com/item/160465.html"
 CSV_FILE = "modian_backers.csv"
+LOG_FILE = "modian_tracker.log"
 
 HEADERS = {
     "User-Agent": (
@@ -27,6 +30,19 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     )
 }
+
+
+def setup_logging():
+    """配置日志：同时输出到控制台与日志文件"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
 
 
 def fetch_tier_data():
@@ -78,7 +94,7 @@ def fetch_tier_data():
 def append_to_csv(data, total_count, total_money):
     """带时间戳追加到 CSV 文件"""
     if not data:
-        print(f"[{datetime.now()}] 未抓取到有效档位数据，请确认页面是否正常。")
+        logging.warning("未抓取到有效档位数据，请确认页面是否正常。")
         return
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -93,7 +109,7 @@ def append_to_csv(data, total_count, total_money):
     else:
         new_df.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
 
-    print(f"[{now_str}] 成功记录 {len(data)} 个档位数据至 {CSV_FILE}")
+    logging.info("成功记录 %d 个档位数据至 %s", len(data), CSV_FILE)
 
 
 def plot_trends():
@@ -140,22 +156,51 @@ def plot_trends():
     plt.show()
 
 
+def run_forever(interval):
+    """按固定间隔循环抓取并记录数据，直到手动中断"""
+    logging.info("开始循环抓取，间隔 %d 秒（按 Ctrl+C 退出）", interval)
+    while True:
+        start = time.monotonic()
+        try:
+            tier_data, total_count, total_money = fetch_tier_data()
+            append_to_csv(tier_data, total_count, total_money)
+        except Exception:
+            logging.exception("本轮抓取失败，将在 %d 秒后重试", interval)
+
+        elapsed = time.monotonic() - start
+        time.sleep(max(0, interval - elapsed))
+
+
 def main():
     parser = argparse.ArgumentParser(description="摩点众筹档位数据监控与可视化工具")
     parser.add_argument(
         "--plot",
         "-p",
         action="store_true",
-        help="绘制折线图（默认不指定时为抓取并保存数据）",
+        help="绘制折线图（不进入循环抓取）",
+    )
+    parser.add_argument(
+        "--interval",
+        "-i",
+        type=int,
+        default=60,
+        help="循环抓取间隔秒数（默认 60）",
     )
 
     args = parser.parse_args()
 
     if args.plot:
         plot_trends()
-    else:
-        tier_data, total_count, total_money = fetch_tier_data()
-        append_to_csv(tier_data, total_count, total_money)
+        return
+
+    if args.interval < 1:
+        parser.error("--interval 必须为正整数秒")
+
+    setup_logging()
+    try:
+        run_forever(args.interval)
+    except KeyboardInterrupt:
+        logging.info("已手动停止循环抓取。")
 
 
 if __name__ == "__main__":
