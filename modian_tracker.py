@@ -3,17 +3,16 @@
 # dependencies = [
 #     "beautifulsoup4>=4.15.0",
 #     "matplotlib>=3.11.2",
-#     "pandas>=3.0.6",
 #     "requests>=2.34.2",
 # ]
 # ///
 import argparse
+import csv
 import logging
 import os
 import re
 import time
 from datetime import datetime
-import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
@@ -89,43 +88,80 @@ def fetch_tier_data():
     return tier_dict, total_count, total_money
 
 
-def normalize_int_columns(df):
-    """将人数类列（除时间戳与总金额外）转为可空整数，避免写出 .0 后缀"""
-    int_cols = [c for c in df.columns if c not in ("timestamp", "总金额")]
-    return df.astype({c: "Int64" for c in int_cols})
+def _clean_cell(value):
+    """去除人数类数值末尾的 .0（如 '4647.0' -> '4647'）；空值保持为空"""
+    if value is None:
+        return ""
+    s = str(value).strip()
+    return s[:-2] if s.endswith(".0") else s
+
+
+def _write_csv(rows, money_idx):
+    """写入 CSV（utf-8-sig）；时间戳与总金额保持原样，其余列去除 .0 后缀"""
+    with open(CSV_FILE, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        for row in rows:
+            cleaned = [
+                "" if cell is None else (cell if i == 0 or i == money_idx else _clean_cell(cell))
+                for i, cell in enumerate(row)
+            ]
+            writer.writerow(cleaned)
 
 
 def append_to_csv(data, total_count, total_money):
-    """带时间戳追加到 CSV 文件"""
+    """带时间戳追加到 CSV 文件（原生 csv 实现，无需 pandas）"""
     if not data:
         logging.warning("未抓取到有效档位数据，请确认页面是否正常。")
         return
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    row = {"timestamp": now_str, "总人数": total_count, "总金额": total_money, **data}
-    new_df = pd.DataFrame([row])
-
+    rows = []
     if os.path.exists(CSV_FILE):
-        existing_df = pd.read_csv(CSV_FILE)
-        # 合并历史数据与新列（宽表对齐）
-        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-        normalize_int_columns(combined_df).to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
-    else:
-        normalize_int_columns(new_df).to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
+        with open(CSV_FILE, "r", encoding="utf-8-sig", newline="") as f:
+            rows = [r for r in csv.reader(f) if r]
 
+    if rows:
+        header = rows[0]
+        # 若页面新增档位列，追加到表头并补齐历史行空位
+        for col in data:
+            if col not in header:
+                header.append(col)
+                for old in rows[1:]:
+                    old.append("")
+    else:
+        header = ["timestamp", "总人数", "总金额", *data.keys()]
+        rows = [header]
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    new_row = [""] * len(header)
+    for i, col in enumerate(header):
+        if col == "timestamp":
+            new_row[i] = now_str
+        elif col == "总人数":
+            new_row[i] = total_count if total_count else ""
+        elif col == "总金额":
+            new_row[i] = total_money if total_money else ""
+        elif col in data:
+            new_row[i] = data[col]
+    rows.append(new_row)
+
+    money_idx = header.index("总金额") if "总金额" in header else None
+    _write_csv(rows, money_idx)
     logging.info("成功记录 %d 个档位数据至 %s", len(data), CSV_FILE)
 
 
 def plot_trends():
-    """读取 CSV 数据并生成折线图"""
+    """读取 CSV 数据并生成折线图（原生 csv 读取，无需 pandas）"""
     if not os.path.exists(CSV_FILE):
         print(f"未找到数据文件: {CSV_FILE}，请先执行记录。")
         return
 
-    df = pd.read_csv(CSV_FILE)
-    if df.empty or "timestamp" not in df.columns:
+    with open(CSV_FILE, "r", encoding="utf-8-sig", newline="") as f:
+        rows = [r for r in csv.reader(f) if r]
+    if len(rows) < 2 or "timestamp" not in rows[0]:
         print("CSV 文件为空或未包含有效时间戳列。")
         return
+
+    header = rows[0]
 
     # 仅在绘图时需要 matplotlib，因此在此处按需导入
     import matplotlib.dates as mdates
@@ -135,20 +171,29 @@ def plot_trends():
     plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "PingFang SC", "sans-serif"]
     plt.rcParams["axes.unicode_minus"] = False
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values(by="timestamp")
+    # 解析时间戳并按时序排序（跳过解析失败的行）
+    parsed = []
+    for r in rows[1:]:
+        try:
+            ts = datetime.strptime(r[0], "%Y-%m-%d %H:%M:%S")
+        except (ValueError, IndexError):
+            continue
+        parsed.append((ts, r))
+    parsed.sort(key=lambda item: item[0])
 
-    tier_columns = [col for col in df.columns if col not in ("timestamp", "总人数", "总金额")]
+    timestamps = [item[0] for item in parsed]
+    tier_columns = [col for col in header if col not in ("timestamp", "总人数", "总金额")]
 
     plt.figure(figsize=(12, 6))
     for col in tier_columns:
-        plt.plot(
-            df["timestamp"],
-            df[col],
-            marker="o",
-            markersize=3,
-            label=f"档位 {col}",
-        )
+        idx = header.index(col)
+        values = []
+        for _, r in parsed:
+            try:
+                values.append(float(r[idx]) if r[idx] else float("nan"))
+            except (ValueError, IndexError):
+                values.append(float("nan"))
+        plt.plot(timestamps, values, marker="o", markersize=3, label=f"档位 {col}")
 
     ax = plt.gca()
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))

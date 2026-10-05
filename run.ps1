@@ -16,6 +16,17 @@ param(
     [int]$Interval = 60
 )
 
+# 设置控制台输出编码为 UTF-8 (65001)
+[System.Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+# 设置控制台输入编码为 UTF-8 (65001)
+[System.Console]::InputEncoding = [System.Text.Encoding]::UTF8
+# 设置管道传给外部程序的默认编码为 UTF-8 (65001)
+$OutputEncoding = [System.Text.Encoding]::UTF8
+# 修改 PowerShell 内部默认编码（影响 Out-File, Redirection 等）
+$OutputEncoding = [System.Text.Encoding]::UTF8
+# 设置 cmdlet 默认参数编码
+$PSDefaultParameterValues['*:Encoding'] = 'utf8'
+
 $ErrorActionPreference = "Stop"
 
 # 切换到脚本所在目录，确保相对路径（CSV/日志）正确
