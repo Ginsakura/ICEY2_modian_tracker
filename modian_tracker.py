@@ -248,9 +248,9 @@ def plot_trends():
     ax1.set_title("摩点众筹各档位支持人数堆积趋势", fontsize=14, fontweight="bold")
     ax1.grid(True, linestyle="--", alpha=0.4)
 
-    ax1.legend(loc="upper left")
+    ax1.legend(loc="best")
     if "总金额" in header:
-        ax2.legend(loc="upper right")
+        ax2.legend(loc="center right")
 
     # 状态栏坐标显示：右下方默认显示 (时间, 已支持份数, 总金额)，普通数值形式
     if "总人数" in header and "总金额" in header:
