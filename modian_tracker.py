@@ -191,6 +191,13 @@ def plot_trends():
         parsed.append((ts, r))
     parsed.sort(key=lambda item: item[0])
 
+    # 取最新一行数据，用于在图例中展示各系列当前值
+    last_row = parsed[-1][1] if parsed else []
+
+    def visual_width(s):
+        """估算渲染宽度：全角字符按 2 个半角字符计，用于空格补齐对齐"""
+        return sum(2 if ord(ch) > 0x2E80 else 1 for ch in s)
+
     timestamps = [item[0] for item in parsed]
     x_dates = mdates.date2num(timestamps)
 
@@ -212,13 +219,29 @@ def plot_trends():
     lv_cols = sorted([c for c in header if c.startswith("Lv")], key=lv_no)
     stack_labels = lv_cols + (["无偿支持"] if "无偿支持" in header else [])
 
+    # 图例标签：列名 + 最新值，用空格补齐使 "--" 竖排对齐（\t 在图例中无法对齐）
+    legend_vals = {
+        c: last_row[header.index(c)]
+        for c in stack_labels + ["总人数", "总金额"]
+        if c in header and last_row
+    }
+    max_left = max((visual_width(c) for c, v in legend_vals.items() if v), default=0)
+    legend_text = {
+        c: (c + " " * (max_left - visual_width(c)) + f"--{v}" if v else c)
+        for c, v in legend_vals.items()
+    }
+
+    def legend_name(col):
+        """返回补齐空格的图例标签，如 'Lv1（￥42）   --4652'"""
+        return legend_text.get(col, col)
+
     fig = plt.figure(f'十周年《艾希》续作《艾希：续》Steam版众筹数据', figsize=(12, 6))
     fig.subplots_adjust(**{"left":0.06,"bottom":0.08,"right":0.94,"top":0.955})
     ax1 = fig.subplots()
 
     # 左轴：支持份数堆积面积图（含各档位），单位万人
     stack_ys = [[v / 1e4 for v in col_values(c)] for c in stack_labels]
-    ax1.stackplot(x_dates, *stack_ys, labels=stack_labels, baseline="zero", alpha=0.85)
+    ax1.stackplot(x_dates, *stack_ys, labels=[legend_name(c) for c in stack_labels], baseline="zero", alpha=0.85)
     ax1.set_ylabel("万人", fontsize=11)
     ax1.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}"))
 
@@ -226,7 +249,7 @@ def plot_trends():
     if "总人数" in header:
         ax1.plot(
             x_dates, [v / 1e4 for v in col_values("总人数")],
-            color="black", linewidth=1.5, marker="o", markersize=3, label="总人数",
+            color="black", linewidth=1.5, marker="o", markersize=3, label=legend_name("总人数"),
         )
 
     # 右轴：总金额折线（单位百万元）
@@ -234,11 +257,16 @@ def plot_trends():
     if "总金额" in header:
         ax2.plot(
             x_dates, [v / 1e6 for v in col_values("总金额")],
-            color="red", linewidth=1.5, marker="s", markersize=3, label="总金额",
+            color="red", linewidth=1.5, marker="s", markersize=3, label=legend_name("总金额"),
         )
         ax2.set_ylabel("总金额（百万元）", fontsize=11, color="red")
         ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}"))
         ax2.tick_params(axis="y", labelcolor="red")
+
+    ax1.yaxis.set_major_locator(mticker.MultipleLocator(1))     # 主刻度间距：1 万人
+    ax1.yaxis.set_minor_locator(mticker.MultipleLocator(0.5))   # 次刻度间距：0.5 万人
+    ax2.yaxis.set_major_locator(mticker.MultipleLocator(0.1))     # 主刻度间距：1 百万元
+    # ax2.yaxis.set_minor_locator(mticker.MultipleLocator(0.1))   # 次刻度间距：0.1 百万元
 
     ax1.set_xlabel("时间", fontsize=11)
     ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
