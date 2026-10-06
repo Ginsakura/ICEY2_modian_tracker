@@ -42,38 +42,40 @@ def setup_logging():
     )
 
 
-def fetch_tier_data():
-    """抓取页面中各档位价格及支持人数"""
-    resp = requests.get(URL, headers=HEADERS, timeout=15)
-    resp.encoding = "utf-8"
-
-    soup = BeautifulSoup(resp.text, "html.parser")
+def parse_tier_data(html):
+    """解析页面 HTML，返回 (档位字典, 总人数, 总金额)"""
+    soup = BeautifulSoup(html, "html.parser")
     tier_dict = {}
 
-    # 定位包含“已支持 ... 份”的文本节点
-    support_elements = soup.find_all(string=re.compile(r"已支持\s*\d+\s*份"))
-
     level = 1
-    for elem in support_elements:
-        card = elem.parent
-        # 向上回溯至包含档位金额与支持数的共同卡片容器
-        for _ in range(4):
-            if card and re.search(r"[¥￥]\s*[\d\.]+", card.get_text()):
-                break
-            if card.parent:
-                card = card.parent
-
+    # 仅选取档位卡片内的计数元素，按页面顺序排列（首个为“无偿支持”）
+    for em in soup.select(".back-list em.count"):
+        card = em.find_parent("div", class_="back-list")
         card_text = card.get_text()
-        price_match = re.search(r"[¥￥]\s*([\d\.]+)", card_text)
-        count_match = re.search(r"已支持\s*(\d+)\s*份", card_text)
 
-        if price_match and count_match:
-            price = price_match.group(1)
-            count = int(count_match.group(1))
-            # 按出现顺序编号为 Lv1、Lv2 ...
-            key = f"Lv{level}（￥{price}）"
-            tier_dict[key] = count
-            level += 1
+        # 优先使用 i 属性（售罄档位文本为“已抢光／限 X 份”，仍可从 i 取得支持数）
+        count = None
+        if em.get("i"):
+            count = int(em["i"])
+        else:
+            count_match = re.search(r"(\d+)\s*份", em.get_text())
+            if count_match:
+                count = int(count_match.group(1))
+        if count is None:
+            continue
+
+        if "无偿支持" in card_text:
+            # 无偿支持为独立档位，不带 Lv 编号与价格
+            tier_dict["无偿支持"] = count
+            continue
+
+        price_match = re.search(r"[¥￥]\s*([\d\.]+)", card_text)
+        if not price_match:
+            continue
+        price = price_match.group(1)
+        # 付费档位按出现顺序编号为 Lv1、Lv2 ...
+        tier_dict[f"Lv{level}（￥{price}）"] = count
+        level += 1
 
     # 提取页面总支持人数与已筹总金额
     total_count = 0
@@ -86,6 +88,13 @@ def fetch_tier_data():
         total_money = float(money_el.get_text().replace(",", "").strip())
 
     return tier_dict, total_count, total_money
+
+
+def fetch_tier_data():
+    """抓取页面中各档位价格及支持人数（首个为无偿支持，其后为 Lv1~Lv9）"""
+    resp = requests.get(URL, headers=HEADERS, timeout=15)
+    resp.encoding = "utf-8"
+    return parse_tier_data(resp.text)
 
 
 def _clean_cell(value):
@@ -166,6 +175,7 @@ def plot_trends():
     # 仅在绘图时需要 matplotlib，因此在此处按需导入
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
 
     # 中文字体设置
     plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "PingFang SC", "sans-serif"]
@@ -182,30 +192,86 @@ def plot_trends():
     parsed.sort(key=lambda item: item[0])
 
     timestamps = [item[0] for item in parsed]
-    tier_columns = [col for col in header if col not in ("timestamp", "总人数", "总金额")]
+    x_dates = mdates.date2num(timestamps)
 
-    plt.figure(figsize=(12, 6))
-    for col in tier_columns:
-        idx = header.index(col)
-        values = []
+    def col_values(name):
+        idx = header.index(name)
+        vals = []
         for _, r in parsed:
             try:
-                values.append(float(r[idx]) if r[idx] else float("nan"))
+                vals.append(float(r[idx]) if r[idx] else float("nan"))
             except (ValueError, IndexError):
-                values.append(float("nan"))
-        plt.plot(timestamps, values, marker="o", markersize=3, label=f"档位 {col}")
+                vals.append(float("nan"))
+        return vals
 
-    ax = plt.gca()
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+    # 堆积顺序：自下而上 Lv1~Lv9、无偿支持
+    def lv_no(col):
+        m = re.search(r"Lv(\d+)", col)
+        return int(m.group(1)) if m else -1
+
+    lv_cols = sorted([c for c in header if c.startswith("Lv")], key=lv_no)
+    stack_labels = lv_cols + (["无偿支持"] if "无偿支持" in header else [])
+
+    fig = plt.figure(f'十周年《艾希》续作《艾希：续》Steam版众筹数据', figsize=(12, 6))
+    fig.subplots_adjust(**{"left":0.06,"bottom":0.08,"right":0.94,"top":0.955})
+    ax1 = fig.subplots()
+
+    # 左轴：支持份数堆积面积图（含各档位），单位万人
+    stack_ys = [[v / 1e4 for v in col_values(c)] for c in stack_labels]
+    ax1.stackplot(x_dates, *stack_ys, labels=stack_labels, baseline="zero", alpha=0.85)
+    ax1.set_ylabel("万人", fontsize=11)
+    ax1.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}"))
+
+    # 左轴：总人数折线（单位万人）
+    if "总人数" in header:
+        ax1.plot(
+            x_dates, [v / 1e4 for v in col_values("总人数")],
+            color="black", linewidth=1.5, marker="o", markersize=3, label="总人数",
+        )
+
+    # 右轴：总金额折线（单位百万元）
+    ax2 = ax1.twinx()
+    if "总金额" in header:
+        ax2.plot(
+            x_dates, [v / 1e6 for v in col_values("总金额")],
+            color="red", linewidth=1.5, marker="s", markersize=3, label="总金额",
+        )
+        ax2.set_ylabel("总金额（百万元）", fontsize=11, color="red")
+        ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}"))
+        ax2.tick_params(axis="y", labelcolor="red")
+
+    ax1.set_xlabel("时间", fontsize=11)
+    ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
     plt.xticks(rotation=30)
 
-    plt.title("摩点众筹各档位购买人数趋势", fontsize=14, fontweight="bold")
-    plt.xlabel("时间", fontsize=11)
-    plt.ylabel("已支持份数", fontsize=11)
-    plt.grid(True, linestyle="--", alpha=0.6)
-    plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.0)
+    ax1.set_title("摩点众筹各档位支持人数堆积趋势", fontsize=14, fontweight="bold")
+    ax1.grid(True, linestyle="--", alpha=0.4)
 
-    plt.tight_layout()
+    ax1.legend(loc="upper left")
+    if "总金额" in header:
+        ax2.legend(loc="upper right")
+
+    # 状态栏坐标显示：右下方默认显示 (时间, 已支持份数, 总金额)，普通数值形式
+    if "总人数" in header and "总金额" in header:
+        time_fmt = mdates.DateFormatter("%Y-%m-%d %H:%M")
+
+        def fmt_coord(x, y, cur_ax):
+            """把鼠标所在坐标映射回两轴数据坐标，拼接为 (时间, 人数, 总金额)"""
+            try:
+                x_fig, y_fig = cur_ax.transData.transform((x, y))
+                x1, people = ax1.transData.inverted().transform((x_fig, y_fig))
+                _, money = ax2.transData.inverted().transform((x_fig, y_fig))
+                # 复用与坐标轴刻度相同的格式化方式，保证时间显示一致
+                time_str = time_fmt.format_ticks([x1])[0]
+                # 轴数据为万人/百万元，这里还原为原始人数与金额显示
+                return f"({time_str}, {people * 1e4:.0f}, {money * 1e6:.2f})"
+            except Exception:
+                return ""
+
+        ax1.format_coord = lambda x, y: fmt_coord(x, y, ax1)
+        ax2.format_coord = lambda x, y: fmt_coord(x, y, ax2)
+
     plt.show()
 
 
