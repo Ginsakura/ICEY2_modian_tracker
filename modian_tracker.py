@@ -273,6 +273,11 @@ def plot_trends():
     ax1.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
     plt.xticks(rotation=30)
 
+    # 时间轴范围：左边界固定为 2026-10-05 22:00 紧贴左侧，右侧留 10 分钟空白
+    x_left = mdates.date2num(datetime(2026, 10, 5, 22, 0))
+    x_right = max(x_dates) + 10 / 1440  # 10 分钟转为 matplotlib 天数单位
+    ax1.set_xlim(x_left, x_right)
+
     ax1.set_title("摩点众筹各档位支持人数堆积趋势", fontsize=14, fontweight="bold")
     ax1.grid(True, linestyle="--", alpha=0.4)
 
