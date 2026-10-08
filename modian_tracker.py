@@ -263,10 +263,10 @@ def plot_trends():
         ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}"))
         ax2.tick_params(axis="y", labelcolor="red")
 
-    ax1.yaxis.set_major_locator(mticker.MultipleLocator(1))     # 主刻度间距：1 万人
+    ax1.yaxis.set_major_locator(mticker.MultipleLocator(2))     # 主刻度间距：1 万人
     ax1.yaxis.set_minor_locator(mticker.MultipleLocator(0.5))   # 次刻度间距：0.5 万人
-    ax2.yaxis.set_major_locator(mticker.MultipleLocator(0.1))     # 主刻度间距：1 百万元
-    # ax2.yaxis.set_minor_locator(mticker.MultipleLocator(0.1))   # 次刻度间距：0.1 百万元
+    ax2.yaxis.set_major_locator(mticker.MultipleLocator(0.5))     # 主刻度间距：1 百万元
+    ax2.yaxis.set_minor_locator(mticker.MultipleLocator(0.1))   # 次刻度间距：0.1 百万元
 
     ax1.set_xlabel("时间", fontsize=11)
     ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
