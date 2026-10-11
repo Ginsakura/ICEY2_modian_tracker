@@ -1,6 +1,6 @@
 .venv/
-十周年《艾希》续作《艾希：续》Steam版众筹开启 - 摩点 - 发现新奇好物_files/
 __pycache__/
 logs/
 **/*.log
-
+.git_sync_state.json
+.trae/
