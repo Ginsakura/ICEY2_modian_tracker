@@ -1,17 +1,17 @@
 """每日 Git 自动同步守护进程（纯标准库，无第三方依赖，Windows / Termux 通用）
 
-每日 23:00 执行一次「git add . + git commit -m "sync data: termux 月日 时分" + git push」，
+每日 22:00 执行一次「git add . + git commit -m "sync data: termux 月日 时分" + git push」，
 push 失败按时间表重试；任一窗口 push 成功即结束本次任务。
 
 重试时间表（次数 = 重试次数，每次间隔 10 分钟，含首试共 次数+1 次尝试）：
-    当日 23:00  重试 3 次
+    当日 22:00  重试 3 次
     次日 08:00  重试 2 次
     次日 12:00  重试 2 次
     次日 18:00  重试 2 次
-18 时窗口全部失败则关闭本次任务，交由下一次 23 时任务。
+18 时窗口全部失败则关闭本次任务，交由下一次 22 时任务。
 
 注意：
-    - 每天仅在 23:00 任务开始时进行一次 add 和 commit，其余时刻仅尝试 push。
+    - 每天仅在 22:00 任务开始时进行一次 add 和 commit，其余时刻仅尝试 push。
     - 任一 push 成功即结束本次任务。
 
 用法:
@@ -31,13 +31,13 @@ from pathlib import Path
 
 # (窗口名, 相对任务起始日偏移天数, 小时, 分钟, 追加的重试次数)
 TASK_WINDOWS = [
-    ("d23", 0, 23, 0, 3),
+    ("d22", 0, 22, 0, 3),
     ("d08", 1, 8, 0, 2),
     ("d12", 1, 12, 0, 2),
     ("d18", 1, 18, 0, 2),
 ]
 RETRY_INTERVAL_MIN = 10  # 重试间隔（分钟）
-COMMIT_PREFIX = "sync data: termux "  # 提交消息前缀，末尾为「月日 时分」，如 "1011 2300"
+COMMIT_PREFIX = "auto sync data: termux "  # 提交消息前缀，末尾为「月日 时分」，如 "1011 2300"
 STATE_FILE = ".git_sync_state.json"
 GIT_TIMEOUT = 120  # 单个 git 命令超时秒数
 
@@ -86,8 +86,8 @@ def window_start(state):
 
 
 def new_task(today):
-    """开启一个以今天为任务起始日的新任务（23:00 节点）"""
-    return {"task_date": str(today.date()), "phase": "d23",
+    """开启一个以今天为任务起始日的新任务（22:00 节点）"""
+    return {"task_date": str(today.date()), "phase": "d22",
             "attempts_used": 0, "commit_done": False}
 
 
@@ -111,8 +111,8 @@ def run_git(args):
 
 
 def do_attempt(state, now):
-    """执行一次尝试：23:00 窗口先 add+commit，然后 push。返回 (新状态, 是否成功)"""
-    if state["phase"] == "d23" and not state["commit_done"]:
+    """执行一次尝试：22:00 窗口先 add+commit，然后 push。返回 (新状态, 是否成功)"""
+    if state["phase"] == "d22" and not state["commit_done"]:
         if run_git(["add", "."]):
             msg = COMMIT_PREFIX + now.strftime("%m%d %H%M")
             run_git(["commit", "-m", msg])
@@ -130,7 +130,7 @@ def advance(state):
     if i == len(phases) - 1:
         state["phase"] = "done"
         state["attempts_used"] = 0
-        log("18 时窗口全部尝试失败，本次任务结束，交由下一次 23 时任务")
+        log("18 时窗口全部尝试失败，本次任务结束，交由下一次 22 时任务")
     else:
         state["phase"] = phases[i + 1]
         state["attempts_used"] = 0
@@ -172,11 +172,11 @@ def tick(state, now):
 
 def next_wakeup(state, now, tick_sec):
     """下一次需要醒来的时刻（datetime），确保不会睡过头多于一个轮询周期"""
-    t23_today = now.replace(hour=23, minute=0, second=0, microsecond=0)
-    if now < t23_today:
-        candidates = [t23_today]
+    t22_today = now.replace(hour=22, minute=0, second=0, microsecond=0)
+    if now < t22_today:
+        candidates = [t22_today]
     else:
-        candidates = [t23_today + timedelta(days=1)]
+        candidates = [t22_today + timedelta(days=1)]
 
     if state["phase"] != "done":
         t_start = window_start(state)
@@ -202,25 +202,25 @@ def dry_run():
     print("-" * 60)
 
     today = now.date()
-    t23 = datetime.combine(today, datetime.min.time()).replace(hour=23, minute=0)
-    if now >= t23:
-        t23 = t23 + timedelta(days=1)
-    print(f"下一新任务  : {t23:%Y-%m-%d %H:%M}（add + commit + push，失败重试 {TASK_WINDOWS[0][4]} 次）")
+    t22 = datetime.combine(today, datetime.min.time()).replace(hour=22, minute=0)
+    if now >= t22:
+        t22 = t22 + timedelta(days=1)
+    print(f"下一新任务  : {t22:%Y-%m-%d %H:%M}（add + commit + push，失败重试 {TASK_WINDOWS[0][4]} 次）")
     print("任务时间表  :")
     for name, days, hour, minute, retries in TASK_WINDOWS:
-        t = (t23 + timedelta(days=days)).replace(hour=hour, minute=minute)
+        t = (t22 + timedelta(days=days)).replace(hour=hour, minute=minute)
         for k in range(retries + 1):
             when = t + timedelta(minutes=k * RETRY_INTERVAL_MIN)
-            tag = "commit+push" if name == "d23" and k == 0 else "push"
+            tag = "commit+push" if name == "d22" and k == 0 else "push"
             print(f"  {when:%m-%d %H:%M}  {name} 第{k+1}次尝试（{tag}）")
-    print("规则        : 任意一次 push 成功即结束任务；18 时全部失败则关闭，交由次日 23 时新任务")
+    print("规则        : 任意一次 push 成功即结束任务；18 时全部失败则关闭，交由次日 22 时新任务")
     return 0
 
 
 def sync_loop(tick_sec=30):
     """同步主循环：可独立运行，也可作为 daemon 线程嵌入 tracker
 
-    每轮：23:00 开新任务（仅此处 add+commit）→ 推进重试状态机 → 按下次唤醒时刻睡眠。
+    每轮：22:00 开新任务（仅此处 add+commit）→ 推进重试状态机 → 按下次唤醒时刻睡眠。
     线程模式下 KeyboardInterrupt 只会发给主线程，此处兜底捕获所有异常防止线程静默死亡。
     """
     log("每日同步守护进程已启动")
@@ -229,9 +229,9 @@ def sync_loop(tick_sec=30):
             now = datetime.now()
             state = load_state()
 
-            # 每日 23:00 开启新任务（覆盖任何历史任务，保证每 24 小时 commit 一次）
-            t23_today = now.replace(hour=23, minute=0, second=0, microsecond=0)
-            if now >= t23_today and state["task_date"] != str(now.date()):
+            # 每日 22:00 开启新任务（覆盖任何历史任务，保证每 24 小时 commit 一次）
+            t22_today = now.replace(hour=22, minute=0, second=0, microsecond=0)
+            if now >= t22_today and state["task_date"] != str(now.date()):
                 state = new_task(now)
                 save_state(state)
                 log(f"开启新任务: task_date={state['task_date']}，"
@@ -268,3 +268,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
