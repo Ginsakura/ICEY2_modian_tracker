@@ -4,3 +4,5 @@ logs/
 **/*.log
 .git_sync_state.json
 .trae/
+*.pid
+
