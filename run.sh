@@ -3,12 +3,18 @@
 # 遇到未定义变量报错并退出
 set -u
 
-# 抓取间隔秒数，默认 60（支持通过第一个位置参数传入，如 ./run.sh 30）
-INTERVAL="${1:-60}"
-
 # 切换到脚本所在绝对目录，保证相对路径正确
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
+
+# PID 文件路径
+PID_FILE="$SCRIPT_DIR/run.pid"
+
+# 控制命令，默认 start
+ACTION="${1:-start}"
+
+# 抓取间隔秒数，默认 60（通过第二个位置参数传入）
+INTERVAL="${2:-60}"
 
 # 检查并激活虚拟环境（Linux/Termux 下路径为 .venv/bin/activate）
 VENV_ACTIVATE="$SCRIPT_DIR/.venv/bin/activate"
@@ -25,12 +31,118 @@ mkdir -p "$LOG_DIR"
 OUT_LOG="$LOG_DIR/launcher.out.log"
 ERR_LOG="$LOG_DIR/launcher.err.log"
 
-# 使用 nohup + 后台运行 (&)，以完全分离的独立进程静默执行
-# 已激活虚拟环境，直接调用原生 python
-nohup python modian_tracker.py --interval "$INTERVAL" > "$OUT_LOG" 2> "$ERR_LOG" &
-PID=$!
+# 获取当前运行状态
+get_status() {
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat "$PID_FILE")
+        if kill -0 "$PID" 2>/dev/null; then
+            echo "running"
+            return 0
+        else
+            echo "dead"
+            return 1
+        fi
+    else
+        echo "stopped"
+        return 1
+    fi
+}
 
-echo "已在后台启动抓取进程 (PID: $PID)，抓取间隔 $INTERVAL 秒。"
-echo "抓取日志: $SCRIPT_DIR/modian_tracker.log"
-echo "启动器日志: $OUT_LOG / $ERR_LOG"
-echo "停止命令: kill $PID"
+# 启动服务
+start() {
+    STATUS=$(get_status)
+    if [ "$STATUS" = "running" ]; then
+        echo "服务已在运行中 (PID: $PID)"
+        return 1
+    fi
+    
+    # 清理死 PID 文件
+    if [ "$STATUS" = "dead" ]; then
+        rm -f "$PID_FILE"
+    fi
+    
+    # 使用 nohup + 后台运行 (&)，以完全分离的独立进程静默执行
+    nohup python modian_tracker.py --interval "$INTERVAL" > "$OUT_LOG" 2> "$ERR_LOG" &
+    PID=$!
+    echo "$PID" > "$PID_FILE"
+    
+    echo "已在后台启动抓取进程 (PID: $PID)，抓取间隔 $INTERVAL 秒。"
+    echo "抓取日志: $SCRIPT_DIR/modian_tracker.log"
+    echo "启动器日志: $OUT_LOG / $ERR_LOG"
+    echo "PID 文件: $PID_FILE"
+}
+
+# 查看状态
+state() {
+    STATUS=$(get_status)
+    if [ "$STATUS" = "running" ]; then
+        echo "服务运行中 (PID: $PID)"
+    elif [ "$STATUS" = "dead" ]; then
+        echo "服务已死亡 (PID 文件存在但进程不存在: $(cat "$PID_FILE"))"
+    else
+        echo "服务已停止"
+    fi
+}
+
+# 停止服务
+stop() {
+    STATUS=$(get_status)
+    if [ "$STATUS" != "running" ]; then
+        echo "服务未在运行"
+        rm -f "$PID_FILE"
+        return 0
+    fi
+    
+    echo "正在停止服务 (PID: $PID)..."
+    kill "$PID" 2>/dev/null
+    
+    # 等待进程退出
+    for i in {1..10}; do
+        if ! kill -0 "$PID" 2>/dev/null; then
+            echo "服务已停止"
+            rm -f "$PID_FILE"
+            return 0
+        fi
+        sleep 1
+    done
+    
+    # 强制杀死
+    echo "强制杀死进程..."
+    kill -9 "$PID" 2>/dev/null
+    rm -f "$PID_FILE"
+    echo "服务已强制停止"
+}
+
+# 重启服务
+restart() {
+    stop
+    sleep 1
+    start
+}
+
+# 主控制逻辑
+case "$ACTION" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        restart
+        ;;
+    state|status)
+        state
+        ;;
+    *)
+        echo "用法: $0 {start|stop|restart|state|status} [间隔秒数]"
+        echo "示例:"
+        echo "  $0              # 启动服务（默认间隔 60 秒）"
+        echo "  $0 start 30     # 启动服务，间隔 30 秒"
+        echo "  $0 stop         # 停止服务"
+        echo "  $0 restart      # 重启服务"
+        echo "  $0 restart 30   # 重启服务，间隔 30 秒"
+        echo "  $0 state        # 查看运行状态"
+        exit 1
+        ;;
+esac
