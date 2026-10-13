@@ -1,0 +1,67 @@
+{
+  "task_flows": {
+    "noon": {
+      "description": "午间任务流：12:00 提交，16:00/18:00 重试",
+      "trigger_hour": 12,
+      "main": {
+        "name": "d12",
+        "days_offset": 0,
+        "hour": 12,
+        "minute": 0,
+        "retries": 3,
+        "interval_minutes": 5
+      },
+      "retries": [
+        {
+          "name": "d16",
+          "days_offset": 0,
+          "hour": 16,
+          "minute": 0,
+          "retries": 2,
+          "interval_minutes": 10
+        },
+        {
+          "name": "d18",
+          "days_offset": 0,
+          "hour": 18,
+          "minute": 0,
+          "retries": 2,
+          "interval_minutes": 10
+        }
+      ]
+    },
+    "night": {
+      "description": "夜间任务流：22:00 提交，次日 03:00/08:00 重试",
+      "trigger_hour": 22,
+      "main": {
+        "name": "d22",
+        "days_offset": 0,
+        "hour": 22,
+        "minute": 0,
+        "retries": 3,
+        "interval_minutes": 5
+      },
+      "retries": [
+        {
+          "name": "d03",
+          "days_offset": 1,
+          "hour": 3,
+          "minute": 0,
+          "retries": 2,
+          "interval_minutes": 10
+        },
+        {
+          "name": "d08",
+          "days_offset": 1,
+          "hour": 8,
+          "minute": 0,
+          "retries": 2,
+          "interval_minutes": 10
+        }
+      ]
+    }
+  },
+  "commit_prefix": "auto sync data: termux ",
+  "git_timeout": 120,
+  "state_file": ".git_sync_state.json"
+}

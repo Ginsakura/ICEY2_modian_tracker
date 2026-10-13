@@ -8,7 +8,6 @@
 # ///
 import argparse
 import csv
-import logging
 import math
 import os
 import re
@@ -19,10 +18,12 @@ import requests
 from bs4 import BeautifulSoup
 
 import sync_data
+from shared_logger import get_logger
+
+logger = get_logger("modian_tracker")
 
 URL = "https://zhongchou.modian.com/item/160465.html"
 CSV_FILE = "data.csv"
-LOG_FILE = "modian_tracker.log"
 
 HEADERS = {
     "User-Agent": (
@@ -41,18 +42,6 @@ MILESTONE_STYLE = {
     "million": {"linestyle": "--", "color": "#4B0082"},      # 深靛紫虚线
     "tenmillion": {"linestyle": "-", "color": "#000000"},    # 黑色实线
 }
-
-def setup_logging():
-    """配置日志：同时输出到控制台与日志文件"""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.FileHandler(LOG_FILE, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
 
 def parse_tier_data(html):
     """解析页面 HTML，返回 (档位字典, 总人数, 总金额)"""
@@ -128,7 +117,7 @@ def _write_csv(rows, money_idx):
 def append_to_csv(data, total_count, total_money):
     """带时间戳追加到 CSV 文件（原生 csv 实现，无需 pandas）"""
     if not data:
-        logging.warning("未抓取到有效档位数据，请确认页面是否正常。")
+        logger.warning("未抓取到有效档位数据，请确认页面是否正常。")
         return
 
     rows = []
@@ -163,7 +152,7 @@ def append_to_csv(data, total_count, total_money):
 
     money_idx = header.index("总金额") if "总金额" in header else None
     _write_csv(rows, money_idx)
-    logging.info("成功记录 %d 个档位数据至 %s", len(data), CSV_FILE)
+    logger.info("成功记录 %d 个档位数据至 %s", len(data), CSV_FILE)
 
 def plot_trends():
     """读取 CSV 数据并生成折线图（原生 csv 读取，无需 pandas）"""
@@ -494,19 +483,19 @@ def plot_trends():
 
 def run_forever(interval):
     """按固定间隔循环抓取并记录数据，直到手动中断"""
-    logging.info("开始循环抓取，间隔 %d 秒（按 Ctrl+C 退出）", interval)
+    logger.info("开始循环抓取，间隔 %d 秒（按 Ctrl+C 退出）", interval)
     # 内嵌每日 git 同步线程：随本进程一同启停（daemon），无需单独驱动 sync 脚本
     threading.Thread(
         target=sync_data.sync_loop, name="git-sync", daemon=True
     ).start()
-    logging.info("每日 git 同步线程已启动（23:00 add/commit/push，按时间表自动重试）")
+    logger.info("每日 git 同步线程已启动（12:00/22:00 add/commit/push，按时间表自动重试）")
     while True:
         start = time.monotonic()
         try:
             tier_data, total_count, total_money = fetch_tier_data()
             append_to_csv(tier_data, total_count, total_money)
         except Exception:
-            logging.exception("本轮抓取失败，将在 %d 秒后重试", interval)
+            logger.exception("本轮抓取失败，将在 %d 秒后重试", interval)
 
         elapsed = time.monotonic() - start
         time.sleep(max(0, interval - elapsed))
@@ -537,11 +526,10 @@ def main():
     if args.interval < 1:
         parser.error("--interval 必须为正整数秒")
 
-    setup_logging()
     try:
         run_forever(args.interval)
     except KeyboardInterrupt:
-        logging.info("已手动停止循环抓取。")
+        logger.info("已手动停止循环抓取。")
 
 
 if __name__ == "__main__":
