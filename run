@@ -31,26 +31,23 @@ mkdir -p "$LOG_DIR"
 OUT_LOG="$LOG_DIR/launcher.out.log"
 ERR_LOG="$LOG_DIR/launcher.err.log"
 
-# 获取当前运行状态
+# 获取当前运行状态（直接设置全局变量 STATUS 和 PID）
 get_status() {
+    STATUS="stopped"
+    PID=""
     if [ -f "$PID_FILE" ]; then
         PID=$(cat "$PID_FILE")
         if kill -0 "$PID" 2>/dev/null; then
-            echo "running"
-            return 0
+            STATUS="running"
         else
-            echo "dead"
-            return 1
+            STATUS="dead"
         fi
-    else
-        echo "stopped"
-        return 1
     fi
 }
 
 # 启动服务
 start() {
-    STATUS=$(get_status)
+    get_status
     if [ "$STATUS" = "running" ]; then
         echo "服务已在运行中 (PID: $PID)"
         return 1
@@ -74,11 +71,11 @@ start() {
 
 # 查看状态
 state() {
-    STATUS=$(get_status)
+    get_status
     if [ "$STATUS" = "running" ]; then
         echo "服务运行中 (PID: $PID)"
     elif [ "$STATUS" = "dead" ]; then
-        echo "服务已死亡 (PID 文件存在但进程不存在: $(cat "$PID_FILE"))"
+        echo "服务已死亡 (PID 文件存在但进程不存在: $PID)"
     else
         echo "服务已停止"
     fi
@@ -86,7 +83,7 @@ state() {
 
 # 停止服务
 stop() {
-    STATUS=$(get_status)
+    get_status
     if [ "$STATUS" != "running" ]; then
         echo "服务未在运行"
         rm -f "$PID_FILE"
