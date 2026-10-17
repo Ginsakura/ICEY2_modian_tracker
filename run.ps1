@@ -61,13 +61,13 @@ $errLog = Join-Path $logDir "launcher.err.log"
 # 获取当前运行状态
 function Get-Status {
     if (Test-Path -LiteralPath $pidFile) {
-        $pid = Get-Content -LiteralPath $pidFile -Raw
-        $pid = $pid.Trim()
+        $processid = Get-Content -LiteralPath $pidFile -Raw
+        $processid = $processid.Trim()
         try {
-            $proc = Get-Process -Id $pid -ErrorAction Stop
-            return @{ Status = "running"; Pid = $pid }
+            $proc = Get-Process -Id $processid -ErrorAction Stop
+            return @{ Status = "running"; Pid = $processid }
         } catch {
-            return @{ Status = "dead"; Pid = $pid }
+            return @{ Status = "dead"; Pid = $processid }
         }
     } else {
         return @{ Status = "stopped"; Pid = $null }
@@ -127,18 +127,18 @@ function Stop-Service {
         return
     }
     
-    $pid = $statusInfo.Pid
-    Write-Host "正在停止服务 (PID: $pid)..."
+    $processid = $statusInfo.Pid
+    Write-Host "正在停止服务 (PID: $processid)..."
     
     try {
-        $proc = Get-Process -Id $pid -ErrorAction Stop
+        $proc = Get-Process -Id $processid -ErrorAction Stop
         $proc | Stop-Process -Force
         
         # 等待进程退出
         $waited = 0
         while ($waited -lt 10) {
             try {
-                $check = Get-Process -Id $pid -ErrorAction Stop
+                $check = Get-Process -Id $processid -ErrorAction Stop
                 Start-Sleep -Seconds 1
                 $waited++
             } catch {
@@ -150,7 +150,7 @@ function Stop-Service {
         
         # 如果还在运行，强制杀死
         Write-Host "强制杀死进程..."
-        Get-Process -Id $pid -ErrorAction SilentlyContinue | Stop-Process -Force
+        Get-Process -Id $processid -ErrorAction SilentlyContinue | Stop-Process -Force
         Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
         Write-Host "服务已强制停止"
     } catch {
