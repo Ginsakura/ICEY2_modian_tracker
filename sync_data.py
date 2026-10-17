@@ -239,6 +239,9 @@ def tick(flow_state, now):
 
     flow_key = flow_state["flow"]
     _, window_tuple = get_window_info(flow_state["phase"])
+    if window_tuple is None:
+        logger.error(f"[{flow_key}] 窗口 {flow_state['phase']} 未找到，无法推进")
+        return flow_state
     _, _, _, _, retries, interval_min = window_tuple
     max_attempts = retries + 1
 
@@ -277,6 +280,9 @@ def next_wakeup_for_flow(flow_state, now):
         return None
 
     _, window_tuple = get_window_info(flow_state["phase"])
+    if window_tuple is None:
+        logger.error(f"[{flow_state['flow']}] 窗口 {flow_state['phase']} 未找到，无法计算下次唤醒时间")
+        return None
     _, _, _, _, retries, interval_min = window_tuple
     max_attempts = retries + 1
 

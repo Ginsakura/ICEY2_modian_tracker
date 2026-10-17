@@ -1,9 +1,9 @@
-"""摩点众筹数据可视化：基础趋势图（--plot）与交互式分析窗口（--analyze）。
+"""摩点众筹数据可视化：基础趋势图(--plot)与交互式分析窗口(--analyze)。
 
-本模块是项目内唯一的绘图实现，采集端（modian_tracker.py）不导入本模块，
+本模块是项目内唯一的绘图实现，采集端(modian_tracker.py)不导入本模块，
 以保证采集功能与 matplotlib 解耦。
 
-类关系（按可复用性拆分）：
+类关系(按可复用性拆分)：
 
     BaseChart        数据加载 + 基础趋势渲染 + 十字跟踪 tooltip，供两种用法复用
       ├─ PlotChart       --plot：渲染后直接显示，输出与重构前逐像素一致
@@ -15,97 +15,106 @@ import os
 import re
 import time
 from datetime import datetime
+from types import MethodType
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
+
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
+from matplotlib.text import Text
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch, Wedge
 from matplotlib.widgets import Button, CheckButtons, RadioButtons, RangeSlider, Slider
+from typing import Any, Literal, Optional
 
-CSV_FILE = "data.csv"
+CSV_FILE: str = "data.csv"
 
-# 总金额里程碑 L 形标注：数据范围内每个整百万倍（27M、28M…，虚线）/整千万倍（30M、40M…，实线），
-# 判定"刚超过"：上一点 < 阈值 ≤ 当前点（相邻点比较）；千万倍数优先，同一点不重复标记。
-# 固定颜色与红色总金额折线及堆积区域色（蓝/橙/绿/红/紫/棕/粉/灰/黄绿/青）均保持可区分
-MILLION_STEP = 1_000_000        # 百万级里程碑间距（虚线）
-TENMILLION_STEP = 10_000_000    # 千万级里程碑间距（实线）
-MILESTONE_STYLE = {
+# 总金额里程碑 L 形标注：数据范围内每个整百万倍(27M、28M…，虚线)/整千万倍(30M、40M…，实线)，
+# 判定"刚超过"：上一点 < 阈值 ≤ 当前点(相邻点比较); 千万倍数优先，同一点不重复标记。
+# 固定颜色与红色总金额折线及堆积区域色(蓝/橙/绿/红/紫/棕/粉/灰/黄绿/青)均保持可区分
+MILLION_STEP: int = 1_000_000        # 百万级里程碑间距(虚线)
+TENMILLION_STEP: int = 10_000_000    # 千万级里程碑间距(实线)
+MILESTONE_STYLE: dict[str, dict[str, str]] = {
     "million": {"linestyle": "--", "color": "#4B0082"},      # 深靛紫虚线
     "tenmillion": {"linestyle": "-", "color": "#000000"},    # 黑色实线
 }
 
-# --plot 时间轴左边界（十周年《艾希》续作众筹起始时刻），右边界为末点 + 10 分钟
-PLOT_X_LEFT = datetime(2026, 10, 5, 22, 0)
-X_RIGHT_PAD = 10 / 1440        # 10 分钟，matplotlib 天数单位
+# --plot 时间轴左边界(十周年《艾希》续作众筹起始时刻)，右边界为末点 + 10 分钟
+PLOT_X_LEFT: datetime = datetime(2026, 10, 5, 22, 0)
+X_RIGHT_PAD: float = 10 / 1440        # 10 分钟，matplotlib 天数单位
 
 
-def _fmt_money(v, _=None):
+def _fmt_money(v: float, _=None) -> str:
     """金额类刻度：千分位整数"""
     return f"{v:,.0f}"
 
 
-class CursorTracker:
-    """十字跟踪虚线 + 数据行提示框（纯 matplotlib 事件 + blitting 双背景优化）。
+class CursorTracker(Figure):
+    """十字跟踪虚线 + 数据行提示框(纯 matplotlib 事件 + blitting 双背景优化)。
 
     生命周期与 Figure 绑定：事件只连接一次，切换视图时用 bind() 重设目标轴与数据。
-    blitting 策略：静态重元素只在重建时渲染一次（bg_clean），tooltip 的多行 CJK 文本
-    渲染开销大（实测 ≈27ms），故仅在跨数据点或对齐状态变化时重建 bg_tt（含 100ms 节流）；
-    每次鼠标移动只恢复背景并重绘十字线（实测 ≈0.4ms）。
+    blitting 策略：静态重元素只在重建时渲染一次(bg_clean)，tooltip 的多行 CJK 文本
+    渲染开销大(实测 ≈27ms)，故仅在跨数据点或对齐状态变化时重建 bg_tt(含 100ms 节流); 
+    每次鼠标移动只恢复背景并重绘十字线(实测 ≈0.4ms)。
     """
 
-    TT_THROTTLE = 0.1   # tooltip 重建节流间隔（秒）
+    TT_THROTTLE: float = 0.1   # tooltip 重建节流间隔(秒)
 
-    def __init__(self, fig):
-        self.fig = fig
-        self.panels = []            # 需要绘制十字线的面板（按绘制层级由外到内）
-        self.anchor_ax = None       # 提示框锚点所在轴
-        self.x_arr = None
-        self.anchor_y = None
-        self.provider = None        # idx -> [文本行]
-        self.vlines = []
-        self.hlines = []
-        self.tooltip = None
-        self._bg_clean = None
-        self._bg_tt = None
-        self._last_key = None
-        self._last_time = 0.0
+    def __init__(self, fig: Figure):
+        self.fig: Figure = fig
+        self.panels: list[Axes] = []            # 需要绘制十字线的面板(按绘制层级由外到内)
+        self.anchor_ax: Optional[Axes] = None       # 提示框锚点所在轴
+        self.x_arr: Optional[np.ndarray] = None
+        self.anchor_y: Optional[np.ndarray] = None
+        self.provider: Optional[MethodType] = None        # idx -> [文本行]
+        self.vlines: list[Line2D] = []
+        self.hlines: list[Line2D] = []
+        self.tooltip: Optional[Text] = None
+        self._bg_clean: Optional[Figure] = None
+        self._bg_tt: Optional[Figure] = None
+        self._last_key: Optional[tuple[int, Any, Literal['top', 'bottom', 'center']]] = None
+        self._last_time: float = 0.0
         fig.canvas.mpl_connect("motion_notify_event", self._on_move)
         for sig in ("button_release_event", "scroll_event", "resize_event"):
             fig.canvas.mpl_connect(sig, self.mark_dirty)
 
-    def mark_dirty(self, event=None):
+    def mark_dirty(self, event=None) -> None:
         """缩放/平移结束或窗口 resize 后背景失效，下次移动时重建"""
-        self._bg_clean = self._bg_tt = None
+        self._bg_clean = None
+        self._bg_tt = None
 
-    def bind(self, panels, anchor_ax, x_arr, anchor_y, provider):
-        """为当前视图（重新）创建十字线与提示框；panels 为空时禁用跟踪"""
+    def bind(self, panels: list[Axes], anchor_ax: Optional[Axes], x_arr: list[float], anchor_y: list[float], provider: Optional[MethodType]) -> None:
+        """为当前视图(重新)创建十字线与提示框; panels 为空时禁用跟踪"""
         self.panels = list(panels)
         self.anchor_ax = anchor_ax
         self.x_arr = np.asarray(x_arr)
         self.anchor_y = np.asarray(anchor_y, dtype=float)
         self.provider = provider
-        self._bg_clean = self._bg_tt = None
+        self._bg_clean = None
+        self._bg_tt = None
         self._last_key = None
         self.vlines = []
         self.hlines = []
         self.tooltip = None
         for ax in self.panels:
-            # zorder=4：高于面板数据线（默认 2）、低于面板 legend（默认 5）
-            vline, = ax.plot([], [], color="gray", linestyle="--", linewidth=1, zorder=4)
-            hline, = ax.plot([], [], color="gray", linestyle="--", linewidth=1, zorder=4)
-            vline.set_visible(False)
-            hline.set_visible(False)
-            self.vlines.append(vline)
-            self.hlines.append(hline)
-        if self.panels:
-            self.tooltip = anchor_ax.text(
+            # zorder=4：高于面板数据线(默认 2)、低于面板 legend(默认 5)
+            vline: list[Line2D] = ax.plot([], [], color="gray", linestyle="--", linewidth=1, zorder=4)
+            hline: list[Line2D] = ax.plot([], [], color="gray", linestyle="--", linewidth=1, zorder=4)
+            vline[0].set_visible(False)
+            hline[0].set_visible(False)
+            self.vlines.append(vline[0])
+            self.hlines.append(hline[0])
+        if self.panels and (self.anchor_ax is not None):
+            self.tooltip = self.anchor_ax.text(
                 0, 0, "", fontsize=9, zorder=4, va="center", ha="left",
                 bbox={"boxstyle": "round", "facecolor": "white", "edgecolor": "gray", "alpha": 0.9},
             )
             self.tooltip.set_visible(False)
 
-    def _hide(self):
+    def _hide(self) -> None:
         """移出绘图区：隐藏三件套并恢复干净背景"""
         if not self.vlines:
             return
@@ -113,24 +122,34 @@ class CursorTracker:
         if not visible:
             return
         for art in self.vlines + self.hlines + [self.tooltip]:
-            art.set_visible(False)
+            if art is not None:
+                art.set_visible(False)
         if self._bg_clean is not None:
             self.fig.canvas.restore_region(self._bg_clean)
             self.fig.canvas.blit(self.fig.bbox)
         else:
             self.fig.canvas.draw_idle()
 
-    def _on_move(self, event):
-        """鼠标移动：更新十字虚线（每帧）与 tooltip（跨数据点时重建背景）"""
+    def _on_move(self, event) -> None:
+        """鼠标移动：更新十字虚线(每帧)与 tooltip(跨数据点时重建背景)"""
         if not self.vlines:
             return
+        if self.anchor_ax is None:
+            return
+        if self.x_arr is None:
+            return
+        if self.anchor_y is None:
+            return
+        if self.tooltip is None:
+            return
+
         if event.inaxes is None or event.xdata is None or event.inaxes not in self.panels:
             self._hide()
             return
         hover_ax = event.inaxes
         x, y = event.xdata, event.ydata
 
-        # 最近数据行 → tooltip 内容与锚点（吸附数据点，位置由 (idx, ha, va) 唯一决定）
+        # 最近数据行 → tooltip 内容与锚点(吸附数据点，位置由 (idx, ha, va) 唯一决定)
         i = int(np.abs(self.x_arr - x).argmin())
         ax_anchor = self.anchor_ax
         x0, x1_ = ax_anchor.get_xlim()
@@ -143,13 +162,13 @@ class CursorTracker:
         key = (i, on_left, va)
 
         if self._bg_clean is None or self._bg_tt is None:
-            # 背景失效（首次/缩放/resize）：设置 tooltip 并整体重建
+            # 背景失效(首次/缩放/resize)：设置 tooltip 并整体重建
             self._apply_tooltip(i, on_left, va, dx)
             self.tooltip.set_visible(True)
             self._rebuild_bgs()
             self._last_key, self._last_time = key, time.monotonic()
         elif key != self._last_key and time.monotonic() - self._last_time >= self.TT_THROTTLE:
-            # 跨数据点或翻转状态变化：更新 tooltip 并重印入背景（节流内跳过，下帧再试）
+            # 跨数据点或翻转状态变化：更新 tooltip 并重印入背景(节流内跳过，下帧再试)
             self._apply_tooltip(i, on_left, va, dx)
             self.fig.canvas.restore_region(self._bg_clean)
             self.tooltip.set_visible(True)
@@ -158,7 +177,7 @@ class CursorTracker:
             self._last_key, self._last_time = key, time.monotonic()
 
         # 每帧快速路径：恢复含 tooltip 的背景 + 仅重绘十字线
-        # 竖线贯穿所有面板，横线只画在鼠标所在面板（多面板视图下的自然读数方式）
+        # 竖线贯穿所有面板，横线只画在鼠标所在面板(多面板视图下的自然读数方式)
         for ax, vline in zip(self.panels, self.vlines):
             vline.set_data([x, x], ax.get_ylim())
             vline.set_visible(True)
@@ -179,6 +198,15 @@ class CursorTracker:
 
     def _apply_tooltip(self, i, on_left, va, dx):
         """把最近数据行的内容写入 tooltip 并按锚点/对齐状态定位"""
+        if self.provider is None:
+            return
+        if self.x_arr is None:
+            return
+        if self.anchor_y is None:
+            return
+        if self.tooltip is None:
+            return
+        
         self.tooltip.set_text("\n".join(self.provider(i)))
         x = self.x_arr[i]
         self.tooltip.set_position((x + dx if on_left else x - dx, self.anchor_y[i]))
@@ -187,10 +215,15 @@ class CursorTracker:
 
     def _rebuild_bgs(self):
         """全量渲染一次静态图，生成干净背景与含 tooltip 的背景快照"""
+        if self.tooltip is None:
+            return
+        if self.anchor_ax is None:
+            return
+        
         vis = [(a, a.get_visible()) for a in self.vlines + self.hlines + [self.tooltip]]
         for a, _ in vis:
             a.set_visible(False)
-        self.fig.canvas.draw()                      # 全量重绘（无三件套），一次性成本
+        self.fig.canvas.draw()                      # 全量重绘(无三件套)，一次性成本
         self._bg_clean = self.fig.canvas.copy_from_bbox(self.fig.bbox)
         if self.tooltip.get_text():
             self.tooltip.set_visible(True)
@@ -203,8 +236,8 @@ class CursorTracker:
 class BaseChart:
     """CSV 数据加载与基础趋势渲染的公共基类。
 
-    子类复用其数据层（load/col_values/聚合/里程碑）与绘图层（draw_trend/
-    attach_dual_status/row_tooltip），并共享 CursorTracker 的交互行为。
+    子类复用其数据层(load/col_values/聚合/里程碑)与绘图层(draw_trend/
+    attach_dual_status/row_tooltip)，并共享 CursorTracker 的交互行为。
     """
 
     def __init__(self, csv_file=CSV_FILE, logger=None):
@@ -218,7 +251,7 @@ class BaseChart:
     # ---------------- 数据层 ----------------
 
     def load(self, quiet=False):
-        """读取 CSV、解析时间戳并按时序排序（解析失败的行跳过）；返回是否成功"""
+        """读取 CSV、解析时间戳并按时序排序(解析失败的行跳过); 返回是否成功"""
         if not os.path.exists(self.csv_file):
             if not quiet:
                 print(f"未找到数据文件: {self.csv_file}，请先执行记录。")
@@ -247,7 +280,7 @@ class BaseChart:
         return True
 
     def cell(self, row, name):
-        """取单元格数值；列缺失、越界或空值返回 NaN"""
+        """取单元格数值; 列缺失、越界或空值返回 NaN"""
         i = self._index.get(name)
         if i is None or i >= len(row):
             return float("nan")
@@ -257,7 +290,7 @@ class BaseChart:
             return float("nan")
 
     def col_values(self, name):
-        """整列数值（空值 -> NaN）"""
+        """整列数值(空值 -> NaN)"""
         i = self._index.get(name)
         if i is None:
             return [float("nan")] * len(self.parsed)
@@ -287,7 +320,7 @@ class BaseChart:
 
     @staticmethod
     def cycle_color(k):
-        """matplotlib 默认配色循环中第 k 个颜色（与 stackplot 自动配色顺序一致）"""
+        """matplotlib 默认配色循环中第 k 个颜色(与 stackplot 自动配色顺序一致)"""
         cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
         return cycle[k % len(cycle)]
 
@@ -297,7 +330,7 @@ class BaseChart:
         return self.cycle_color(labels.index(label) if label in labels else 0)
 
     def tier_prices(self):
-        """付费档位（列名, 价格）按价格升序"""
+        """付费档位(列名, 价格)按价格升序"""
         out = []
         for col in self.lv_cols():
             m = re.search(r"[¥￥]\s*([\d.]+)", col)
@@ -310,8 +343,8 @@ class BaseChart:
         """估算渲染宽度：全角字符按 2 个半角字符计，用于空格补齐对齐"""
         return sum(2 if ord(ch) > 0x2E80 else 1 for ch in s)
 
-    def legend_names(self, last_row):
-        """图例标签：列名 + 最新值，空格补齐使 '--' 竖排对齐（\\t 在图例中无法对齐）"""
+    def legend_names(self, last_row) -> dict[str, str]:
+        """图例标签：列名 + 最新值，空格补齐使 '--' 竖排对齐(\\t 在图例中无法对齐)"""
         values = {}
         for c in self.stack_labels() + ["总人数", "总金额"]:
             i = self._index.get(c)
@@ -324,18 +357,18 @@ class BaseChart:
             for c, v in values.items()
         }
 
-    def row_tooltip(self, i):
-        """数据行提示框内容：时间 + 该行全部列（与重构前一致）"""
+    def row_tooltip(self, i) -> list[str]:
+        """数据行提示框内容：时间 + 该行全部列(与重构前一致)"""
         ts, row = self.parsed[i]
-        parts = [ts.strftime("%Y-%m-%d %H:%M:%S")]
+        parts: list[str] = [ts.strftime("%Y-%m-%d %H:%M:%S")]
         for name, val in zip(self.header, row):
             if name == "timestamp":
                 continue
             parts.append(f"{name}: {val if val else '--'}")
         return parts
 
-    def share_matrix(self, labels):
-        """各档位占比序列（分母为该行档位人数之和，页面总数与档位和并不一致）。
+    def share_matrix(self, labels) -> tuple[list[datetime], list[list[float]], list[float]]:
+        """各档位占比序列(分母为该行档位人数之和，页面总数与档位和并不一致)。
 
         返回 (时间列表, [[各标签百分比序列]], [该行档位数总和])
         """
@@ -355,8 +388,8 @@ class BaseChart:
                 series[k].append(v / total * 100)
         return xs, series, totals
 
-    def aggregate(self, seconds):
-        """按时间桶聚合（取桶内最后一行，累计值语义）；seconds 为 None 时用原始采样点"""
+    def aggregate(self, seconds) -> list[tuple[datetime, float, float]]:
+        """按时间桶聚合(取桶内最后一行，累计值语义); seconds 为 None 时用原始采样点"""
         points = []
         for ts, row in self.parsed:
             p = self.cell(row, "总人数")
@@ -371,7 +404,7 @@ class BaseChart:
             buckets[int(ts.timestamp()) // seconds] = (ts, p, m)
         return [buckets[k] for k in sorted(buckets)]
 
-    def rate_series(self, seconds):
+    def rate_series(self, seconds) -> tuple[list[datetime], list[float], list[float]]:
         """增速序列：返回 (时间, 人数增速(人/时), 金额增速(元/时))"""
         pts = self.aggregate(seconds)
         xs, rp, rm = [], [], []
@@ -385,7 +418,7 @@ class BaseChart:
             rm.append((cur[2] - prev[2]) / dt_h)
         return xs, rp, rm
 
-    def arpu_series(self, seconds):
+    def arpu_series(self, seconds) -> tuple[list[datetime], list[float], list[float]]:
         """客单价序列：返回 (时间, 累计客单价(元/人), 边际客单价(元/人))"""
         pts = self.aggregate(seconds)
         xs, cum, marg = [], [], []
@@ -400,10 +433,10 @@ class BaseChart:
             marg.append((m - prev_m) / d_p if d_p > 0 else float("nan"))
         return xs, cum, marg
 
-    def milestones(self):
-        """每个整百万倍里程碑：返回值含跨越时刻、相对上一里程碑的耗时（小时）。
+    def milestones(self) -> list[dict]:
+        """每个整百万倍里程碑：返回值含跨越时刻、相对上一里程碑的耗时(小时)。
 
-        首个里程碑自首个有效金额点起算，区间不完整（partial=True）。
+        首个里程碑自首个有效金额点起算，区间不完整(partial=True)。
         """
         money = self.col_values("总金额")
         valid = [i for i, v in enumerate(money) if not math.isnan(v)]
@@ -438,17 +471,17 @@ class BaseChart:
     # ---------------- 绘图层 ----------------
 
     @staticmethod
-    def setup_fonts():
+    def setup_fonts() -> None:
         plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "PingFang SC", "sans-serif"]
         plt.rcParams["axes.unicode_minus"] = False
 
     @staticmethod
-    def rotate_xlabels(ax, deg=30):
+    def rotate_xlabels(ax, deg=30) -> None:
         for label in ax.get_xticklabels():
             label.set_rotation(deg)
 
-    def draw_trend(self, ax1, *, visible=None, xlim=None, title=None):
-        """在给定左轴上绘制基础趋势（堆积面积 + 总人数折线 + 总金额折线 + 里程碑标注）。
+    def draw_trend(self, ax1, *, visible=None, xlim=None, title=None) -> dict[str, Any]:
+        """在给定左轴上绘制基础趋势(堆积面积 + 总人数折线 + 总金额折线 + 里程碑标注)。
 
         返回绘图产物，供交互层复用：
         {ax2, line_people, line_money, money_vals_m, x_dates, anchor_y}
@@ -459,7 +492,7 @@ class BaseChart:
         names = self.legend_names(last_row)
 
         def legend_name(col):
-            """返回补齐空格的图例标签，如 'Lv1（￥42）   --4652'"""
+            """返回补齐空格的图例标签，如 'Lv1(￥42)   --4652'"""
             return names.get(col, col)
 
         labels = self.stack_labels()
@@ -472,12 +505,12 @@ class BaseChart:
                 series_ys.append([v / 1e4 for v in self.col_values(col)])
                 series_labels.append(legend_name(col))
 
-        # 左轴：支持份数堆积面积图（含各档位），单位万人
+        # 左轴：支持份数堆积面积图(含各档位)，单位万人
         ax1.stackplot(x_dates, *series_ys, labels=series_labels, baseline="zero", alpha=0.85)
         ax1.set_ylabel("万人", fontsize=11)
         ax1.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}"))
 
-        # 左轴：总人数折线（单位万人）
+        # 左轴：总人数折线(单位万人)
         line_people = None
         if "总人数" in self.header:
             line_people, = ax1.plot(
@@ -485,23 +518,23 @@ class BaseChart:
                 color="black", linewidth=2, label=legend_name("总人数"),
             )
 
-        # 右轴：总金额折线（单位百万元）
+        # 右轴：总金额折线(单位百万元)
         line_money = None
         money_vals_m = None
         money_yuan = None
         ax2 = ax1.twinx()
         if "总金额" in self.header:
-            money_yuan = self.col_values("总金额")          # 原始金额（元）
+            money_yuan = self.col_values("总金额")          # 原始金额(元)
             money_vals_m = [v / 1e6 for v in money_yuan]
             line_money, = ax2.plot(
                 x_dates, money_vals_m,
                 color="red", linewidth=2, label=legend_name("总金额"),
             )
-            ax2.set_ylabel("总金额（百万元）", fontsize=11, color="red")
+            ax2.set_ylabel("总金额(百万元)", fontsize=11, color="red")
             ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}"))
             ax2.tick_params(axis="y", labelcolor="red")
 
-            # 总金额里程碑 L 形标注（整百万倍虚线 / 整千万倍实线，连到 X/Y 轴）
+            # 总金额里程碑 L 形标注(整百万倍虚线 / 整千万倍实线，连到 X/Y 轴)
             valid_m = [v for v in money_vals_m if not math.isnan(v)]
             if valid_m:
                 lo, hi = min(valid_m), max(valid_m)
@@ -511,8 +544,8 @@ class BaseChart:
 
                 def milestone_points(step):
                     """返回 [(idx, 阈值)]：每个整 step 倍数的跨越点。
-                    判定：上一点 < k*step ≤ 当前点（相邻点比较，跳过 NaN），即"刚超过"的第一个点；
-                    倍数发生在数据范围之外（首点之前）时自然无命中。"""
+                    判定：上一点 < k*step ≤ 当前点(相邻点比较，跳过 NaN)，即"刚超过"的第一个点; 
+                    倍数发生在数据范围之外(首点之前)时自然无命中。"""
                     max_v = max(v for v in money_yuan if not math.isnan(v))
                     marks = []
                     for k in range(1, int(max_v // step) + 1):
@@ -533,7 +566,7 @@ class BaseChart:
                 mil_marks = [(i, t) for i, t in milestone_points(MILLION_STEP) if i not in ten_idx]
 
                 y_bottom, _ = ax2.get_ylim()
-                x_right = x_dates[-1] + X_RIGHT_PAD   # 与 xlim 右边界一致（横线连到右侧 Y 轴）
+                x_right = x_dates[-1] + X_RIGHT_PAD   # 与 xlim 右边界一致(横线连到右侧 Y 轴)
                 for kind, marks in (("million", mil_marks), ("tenmillion", ten_marks)):
                     style = MILESTONE_STYLE[kind]
                     for idx, _threshold in marks:
@@ -541,7 +574,7 @@ class BaseChart:
                         y_i = money_vals_m[idx]
                         # 竖线：里程碑点垂直向下连到 X 轴
                         ax2.plot([x_i, x_i], [y_bottom, y_i], **style, linewidth=1.0)
-                        # 横线：里程碑点水平向右连到 Y 轴（右侧 spine）
+                        # 横线：里程碑点水平向右连到 Y 轴(右侧 spine)
                         ax2.plot([x_i, x_right], [y_i, y_i], **style, linewidth=1.0)
 
         ax1.yaxis.set_major_locator(mticker.MultipleLocator(2))     # 主刻度间距：1 万人
@@ -552,10 +585,10 @@ class BaseChart:
         ax1.set_xlabel("时间", fontsize=11)
         ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
         ax1.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
-        # 与重构前保持逐像素一致；分析视图的当前轴不一定是 ax1，故由调用方另行补一次旋转
+        # 与重构前保持逐像素一致; 分析视图的当前轴不一定是 ax1，故由调用方另行补一次旋转
         plt.xticks(rotation=30)
 
-        # 时间轴范围：--plot 默认左边界固定紧贴左侧、右侧留 10 分钟空白；分析视图传入窗口范围
+        # 时间轴范围：--plot 默认左边界固定紧贴左侧、右侧留 10 分钟空白; 分析视图传入窗口范围
         if xlim is None:
             xlim = (mdates.date2num(PLOT_X_LEFT), x_dates[-1] + X_RIGHT_PAD)
         ax1.set_xlim(*xlim)
@@ -570,7 +603,7 @@ class BaseChart:
         if "总金额" in self.header:
             ax2.legend(loc="center left")
 
-        # tooltip 锚点 y：金额线交点（无金额线时映射人数线交点到右轴坐标）
+        # tooltip 锚点 y：金额线交点(无金额线时映射人数线交点到右轴坐标)
         anchor_y = None
         if money_vals_m is not None:
             anchor_y = np.asarray(money_vals_m)
@@ -626,7 +659,7 @@ class BaseChart:
 
 
 class PlotChart(BaseChart):
-    """--plot：基础趋势图，渲染结果与重构前完全一致（无控件、无分析视图）。"""
+    """--plot：基础趋势图，渲染结果与重构前完全一致(无控件、无分析视图)。"""
 
     def plot(self):
         self.setup_fonts()
@@ -653,8 +686,8 @@ class PlotChart(BaseChart):
 class AnalyzeChart(BaseChart):
     """--analyze：交互式分析窗口。
 
-    基础绘图复用 BaseChart.render 产物；在此基础上提供五个视图与
-    matplotlib 原生控件（视图切换 / 时间窗口 / 聚合粒度 / 档位显隐 / 重置），
+    基础绘图复用 BaseChart.render 产物; 在此基础上提供五个视图与
+    matplotlib 原生控件(视图切换 / 时间窗口 / 聚合粒度 / 档位显隐 / 重置)，
     并轮询 CSV 变化以保留控件状态实时重绘。
     """
 
@@ -676,9 +709,9 @@ class AnalyzeChart(BaseChart):
     PANEL_GAP = 0.02                            # 上下子图之间的留白
     SLIDER_RECT = [0.215, 0.058, 0.62, 0.028]
     SNAP_RECT = [0.215, 0.014, 0.62, 0.028]
-    DONUT_RECT = [0.645, 0.245, 0.30, 0.50]     # 正方形（width * 15 == height * 9）
-    MARGINAL_YLIM = (0, 650)                    # 边际客单价显示范围（覆盖全部档位价格线）
-    PRICE_CLUSTER_GAP = 12                      # 价格参考线标注合并阈值（元）
+    DONUT_RECT = [0.645, 0.245, 0.30, 0.50]     # 正方形(width * 15 == height * 9)
+    MARGINAL_YLIM = (0, 650)                    # 边际客单价显示范围(覆盖全部档位价格线)
+    PRICE_CLUSTER_GAP = 12                      # 价格参考线标注合并阈值(元)
 
     def __init__(self, csv_file=CSV_FILE, logger=None, refresh_interval=60):
         super().__init__(csv_file=csv_file, logger=logger)
@@ -743,7 +776,7 @@ class AnalyzeChart(BaseChart):
         )
         self.radio_gran.on_clicked(self._on_gran_change)
 
-        # 重置（交互逃生通道）
+        # 重置(交互逃生通道)
         self._ax_reset = ctrl_ax([0.015, 0.42, 0.145, 0.04])
         self.btn_reset = Button(self._ax_reset, "重置", hovercolor="#d9d9d9")
         self.btn_reset.on_clicked(self._on_reset)
@@ -753,7 +786,7 @@ class AnalyzeChart(BaseChart):
         self._ax_tier.set_title("档位显隐", fontsize=10, pad=2)
         self._build_tier_check()
 
-        # 时间窗口（RangeSlider：起止双柄，作用于所有时序视图）
+        # 时间窗口(RangeSlider：起止双柄，作用于所有时序视图)
         ax_time = ctrl_ax(self.SLIDER_RECT)
         n = max(0, len(self.parsed) - 1)
         self.slider_window = RangeSlider(
@@ -761,7 +794,7 @@ class AnalyzeChart(BaseChart):
         )
         self.slider_window.on_changed(self._on_window_change)
 
-        # 快照时刻（仅占比视图的环形图使用）
+        # 快照时刻(仅占比视图的环形图使用)
         ax_snap = ctrl_ax(self.SNAP_RECT)
         self.slider_snap = Slider(
             ax_snap, "快照时刻", 0, n, valinit=n, valstep=1, valfmt="%d",
@@ -780,7 +813,7 @@ class AnalyzeChart(BaseChart):
         self.check_tier.on_clicked(self._on_tier_toggle)
 
     def _sync_control_state(self):
-        """按当前视图标注各控件是否适用（不适用则置灰并停用交互）"""
+        """按当前视图标注各控件是否适用(不适用则置灰并停用交互)"""
         view = self.state["view"]
         gran_on = view in self.GRAN_APPLIES
         tier_on = view in (self.VIEW_TREND, self.VIEW_SHARE)
@@ -788,17 +821,17 @@ class AnalyzeChart(BaseChart):
         snap_on = view == self.VIEW_SHARE
 
         # RadioButtons / CheckButtons 的 set_active() 是"选中第 N 项"，
-        # 启停须走 Widget.active 属性（Slider 的 set_active 才是启停）
+        # 启停须走 Widget.active 属性(Slider 的 set_active 才是启停)
         self.radio_gran.active = gran_on
-        self._ax_gran.set_title("聚合粒度" + ("" if gran_on else "（本视图不适用）"), fontsize=10, pad=2)
+        self._ax_gran.set_title("聚合粒度" + ("" if gran_on else "(本视图不适用)"), fontsize=10, pad=2)
         self.check_tier.active = tier_on
-        self._ax_tier.set_title("档位显隐" + ("" if tier_on else "（本视图不适用）"), fontsize=10, pad=2)
+        self._ax_tier.set_title("档位显隐" + ("" if tier_on else "(本视图不适用)"), fontsize=10, pad=2)
         self.slider_window.set_active(window_on)
-        self.slider_window.label.set_text("时间窗口" if window_on else "时间窗口（本视图不适用）")
+        self.slider_window.label.set_text("时间窗口" if window_on else "时间窗口(本视图不适用)")
         self.slider_snap.ax.set_visible(snap_on)
 
     def _sync_slider_text(self):
-        """滑块数值文本改为可读时间（默认 valfmt 只显示索引）"""
+        """滑块数值文本改为可读时间(默认 valfmt 只显示索引)"""
         lo, hi = self.state["window"]
         t_lo = self.parsed[lo][0] if self.parsed else None
         t_hi = self.parsed[hi][0] if self.parsed else None
@@ -856,7 +889,7 @@ class AnalyzeChart(BaseChart):
         self.state["snapshot"] = idx
         self._sync_slider_text()
         if self.state["view"] == self.VIEW_SHARE and self._snapshot_ax is not None:
-            # 快照面板很小，直接清空重绘该面板即可（widget 自身只 blit 自己区域）
+            # 快照面板很小，直接清空重绘该面板即可(widget 自身只 blit 自己区域)
             self._draw_snapshot(self._snapshot_ax)
             self.fig.canvas.draw_idle()
 
@@ -938,7 +971,7 @@ class AnalyzeChart(BaseChart):
 
     # ---------------- 视图渲染 ----------------
 
-    def _clear_view_axes(self):
+    def _clear_view_axes(self) -> None:
         for ax in list(self.fig.axes):
             if ax in self._ctrl_axes:
                 continue
@@ -946,8 +979,8 @@ class AnalyzeChart(BaseChart):
         self._snapshot_ax = None
         self.cursor.bind(panels=[], anchor_ax=None, x_arr=[], anchor_y=[], provider=None)
 
-    def window_xlim(self, pad=True):
-        """时间窗口对应的 x 轴范围（matplotlib 日期数值）"""
+    def window_xlim(self, pad=True) -> Optional[tuple[NDArray, float]]:
+        """时间窗口对应的 x 轴范围(matplotlib 日期数值)"""
         if not self.parsed:
             return None
         lo, hi = self.state["window"]
@@ -958,23 +991,23 @@ class AnalyzeChart(BaseChart):
             mdates.date2num(self.parsed[hi][0]) + (X_RIGHT_PAD if pad else 0),
         )
 
-    def _notice(self, text):
+    def _notice(self, text: str) -> None:
         """数据不足时的占位面板"""
-        ax = self.fig.add_axes([self.PLOT_L, self.PLOT_B, self.PLOT_R - self.PLOT_L, self.PLOT_T - self.PLOT_B])
+        ax = self.fig.add_axes((self.PLOT_L, self.PLOT_B, self.PLOT_R - self.PLOT_L, self.PLOT_T - self.PLOT_B))
         ax.set_xticks([])
         ax.set_yticks([])
         ax.text(0.5, 0.5, text, ha="center", va="center", fontsize=12, color="#666666")
         ax.set_title(self.state["view"], fontsize=13)
 
-    def _apply_time_axis(self, ax, xlim=None):
-        """时序视图统一的时间轴样式（刻度水平放置，避免 30° 倾斜时伸入下方滑块区）"""
+    def _apply_time_axis(self, ax, xlim=None) -> None:
+        """时序视图统一的时间轴样式(刻度水平放置，避免 30° 倾斜时伸入下方滑块区)"""
         ax.xaxis.set_major_locator(mdates.AutoDateLocator())
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
         self.rotate_xlabels(ax, 0)
         if xlim:
             ax.set_xlim(*xlim)
 
-    def render_view(self):
+    def render_view(self) -> None:
         """清空绘图区并按当前状态重绘选中视图，随后同步控件可用状态"""
         self._clear_view_axes()
         view = self.state["view"]
@@ -991,7 +1024,7 @@ class AnalyzeChart(BaseChart):
         self._sync_control_state()
         self.fig.canvas.draw_idle()
 
-    # ---- 视图一：基础趋势（复用 BaseChart 基础渲染）----
+    # ---- 视图一：基础趋势(复用 BaseChart 基础渲染)----
 
     def _draw_trend_view(self):
         rect = [self.PLOT_L, self.PLOT_B, self.PLOT_R - self.PLOT_L, self.PLOT_T - self.PLOT_B]
@@ -1007,7 +1040,7 @@ class AnalyzeChart(BaseChart):
                 provider=self.row_tooltip,
             )
 
-    # ---- 视图二：增速分析（上下双子图，量纲独立）----
+    # ---- 视图二：增速分析(上下双子图，量纲独立)----
 
     def _draw_growth_view(self):
         sec = self.GRAN_SECONDS[self.state["gran"]]
@@ -1027,7 +1060,7 @@ class AnalyzeChart(BaseChart):
         ax_p.plot(x, rp, color="#1f77b4", linewidth=1.2)
         ax_p.axhline(0, color="#999999", linewidth=0.8, linestyle="--")
         ax_p.set_ylabel("人/小时", fontsize=10)
-        ax_p.set_title(f"人数增速（{gran}聚合，负值为退订）", fontsize=12, fontweight="bold")
+        ax_p.set_title(f"人数增速({gran}聚合，负值为退订)", fontsize=12, fontweight="bold")
         ax_p.grid(True, linestyle="--", alpha=0.4)
 
         ax_m.plot(x, rm, color="#d62728", linewidth=1.2)
@@ -1036,7 +1069,7 @@ class AnalyzeChart(BaseChart):
         ax_m.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_money))
         ax_m.tick_params(axis="y", labelcolor="#d62728")
         ax_m.set_xlabel("时间", fontsize=11)
-        ax_m.set_title(f"金额增速（{gran}聚合）", fontsize=12, fontweight="bold")
+        ax_m.set_title(f"金额增速({gran}聚合)", fontsize=12, fontweight="bold")
         ax_m.grid(True, linestyle="--", alpha=0.4)
 
         self._apply_time_axis(ax_m, self.window_xlim())
@@ -1055,7 +1088,7 @@ class AnalyzeChart(BaseChart):
             x_arr=x, anchor_y=np.asarray(rp, dtype=float), provider=provider,
         )
 
-    # ---- 视图三：档位结构占比（100% 堆积 + 环形快照）----
+    # ---- 视图三：档位结构占比(100% 堆积 + 环形快照)----
 
     def _draw_share_view(self):
         labels = [c for c in self.stack_labels() if self.state["visible"].get(c, True)]
@@ -1068,14 +1101,14 @@ class AnalyzeChart(BaseChart):
             return
         x = mdates.date2num(xs)
         ax = self.fig.add_axes([self.PLOT_L, self.PLOT_B, 0.44, self.PLOT_T - self.PLOT_B])
-        # 显式指定颜色，保证隐藏档位后其余档位配色不变（与基础趋势图一致）
+        # 显式指定颜色，保证隐藏档位后其余档位配色不变(与基础趋势图一致)
         ax.stackplot(x, *series,
                      labels=labels, colors=[self.tier_color(c) for c in labels],
                      baseline="zero", alpha=0.85)
         ax.set_ylim(0, 100)
-        ax.set_ylabel("占比（%）", fontsize=11)
+        ax.set_ylabel("占比(%)", fontsize=11)
         ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.0f}"))
-        ax.set_title("档位结构占比迁移（占档位人数总和）", fontsize=12, fontweight="bold")
+        ax.set_title("档位结构占比迁移(占档位人数总和)", fontsize=12, fontweight="bold")
         ax.grid(True, linestyle="--", alpha=0.4)
         self._apply_time_axis(ax, self.window_xlim())
         self.attach_time_status(ax, " %")
@@ -1096,7 +1129,7 @@ class AnalyzeChart(BaseChart):
         )
 
     def _draw_snapshot(self, ax):
-        """环形图快照：档位顺序固定为 Lv1~Lv9、无偿支持（与堆积顺序一致），极小档位由图例数字兜底"""
+        """环形图快照：档位顺序固定为 Lv1~Lv9、无偿支持(与堆积顺序一致)，极小档位由图例数字兜底"""
         ax.clear()
         labels = self.stack_labels()
         if not self.parsed:
@@ -1122,7 +1155,7 @@ class AnalyzeChart(BaseChart):
             ax.text(0, 0, "无档位数据", ha="center", va="center", fontsize=10, color="#666666")
             return
 
-        radius, width = 1.00, 0.24           # 外半径与环宽（环细一些，图例移到图下方）
+        radius, width = 1.00, 0.24           # 外半径与环宽(环细一些，图例移到图下方)
         theta = 90.0                          # 自 12 点方向顺时针
         for name, v in pairs:
             frac = v / total
@@ -1159,7 +1192,7 @@ class AnalyzeChart(BaseChart):
         x = mdates.date2num(xs)
         w = self.PLOT_R - self.PLOT_L
         gran = self.GRAN_LABELS[self.state["gran"]]
-        # 上：边际客单价（新用户实际支付水平）叠加档位价格参考线
+        # 上：边际客单价(新用户实际支付水平)叠加档位价格参考线
         # 下：累计客单价单独放大，避免与 42~598 元的价格线量纲互相压平
         ax_m = self.fig.add_axes([self.PLOT_L, self.PLOT_T - 0.425, w, 0.425])
         top_c = self.PLOT_T - 0.425 - self.PANEL_GAP
@@ -1172,20 +1205,20 @@ class AnalyzeChart(BaseChart):
         ax_m.plot(x, marg, color="#1f77b4", linewidth=1.2, zorder=3)
         ax_m.set_ylim(*self.MARGINAL_YLIM)
         ax_m.set_ylabel("元/人", fontsize=10)
-        ax_m.set_title(f"边际客单价（{gran}聚合，Δ金额/Δ人数）与档位价格参考线",
+        ax_m.set_title(f"边际客单价({gran}聚合，Δ金额/Δ人数)与档位价格参考线",
                        fontsize=12, fontweight="bold")
         ax_m.grid(True, linestyle="--", alpha=0.4)
         self._label_price_lines(ax_m, prices)
         lo, hi = self.MARGINAL_YLIM
         out_of_range = sum(1 for v in marg if math.isnan(v) or not (lo <= v <= hi))
         if out_of_range:
-            ax_m.text(0.01, 0.02, f"{out_of_range} 个点不在 {lo:.0f}~{hi:.0f} 元区间（未显示）",
+            ax_m.text(0.01, 0.02, f"{out_of_range} 个点不在 {lo:.0f}~{hi:.0f} 元区间(未显示)",
                       transform=ax_m.transAxes, fontsize=8, color="#777777", va="bottom")
 
         ax_c.plot(x, cum, color="red", linewidth=1.6)
         ax_c.set_ylabel("元/人", fontsize=10, color="red")
         ax_c.tick_params(axis="y", labelcolor="red")
-        ax_c.set_title("累计客单价（总金额 ÷ 总人数）", fontsize=12, fontweight="bold")
+        ax_c.set_title("累计客单价(总金额 ÷ 总人数)", fontsize=12, fontweight="bold")
         ax_c.grid(True, linestyle="--", alpha=0.4)
         ax_c.set_xlabel("时间", fontsize=11)
         if cum:
@@ -1214,7 +1247,7 @@ class AnalyzeChart(BaseChart):
         )
 
     def _label_price_lines(self, ax, prices):
-        """价格参考线右侧直接标注；间距过小的价格（如 42 / 45.6）合并为同一标注"""
+        """价格参考线右侧直接标注; 间距过小的价格(如 42 / 45.6)合并为同一标注"""
         clusters = []
         for col, price in prices:
             if clusters and price - clusters[-1][-1][1] < self.PRICE_CLUSTER_GAP:
@@ -1239,7 +1272,7 @@ class AnalyzeChart(BaseChart):
         axr = ax.twinx()
         xs = mdates.date2num([m["ts"] for m in marks])
 
-        bar_w = 8 / 24                          # 固定 8 小时宽度的柱（时间点标记，非耗时跨度）
+        bar_w = 8 / 24                          # 固定 8 小时宽度的柱(时间点标记，非耗时跨度)
         for m, x in zip(marks, xs):
             color = "#4B0082" if m["tenmillion"] else "#1f77b4"
             ax.bar(x, m["hours"], width=bar_w, color=color, edgecolor="#333333",
@@ -1252,18 +1285,18 @@ class AnalyzeChart(BaseChart):
 
         hours = [m["hours"] for m in marks]
         ax.set_ylim(0, max(hours) * 1.28)
-        ax.set_ylabel("耗时（小时）", fontsize=11)
-        ax.set_title("里程碑节奏：每提升 100 万元所需的耗时（紫柱为千万元级）",
+        ax.set_ylabel("耗时(小时)", fontsize=11)
+        ax.set_title("里程碑节奏：每提升 100 万元所需的耗时(紫柱为千万元级)",
                      fontsize=13, fontweight="bold")
         ax.grid(True, axis="y", linestyle="--", alpha=0.4)
         ax.text(0.01, 0.97, "* 首个里程碑自数据起点起算，区间不完整，耗时偏小",
                 transform=ax.transAxes, fontsize=8, color="#777777", va="top", zorder=6)
 
-        # 累计金额曲线（右轴）：作为"当时筹款斜率"的上下文
+        # 累计金额曲线(右轴)：作为"当时筹款斜率"的上下文
         money_m = [v / MILLION_STEP if not math.isnan(v) else float("nan")
                    for v in self.col_values("总金额")]
         axr.plot(self.x_dates(), money_m, color="red", linewidth=1.6, alpha=0.55, zorder=2)
-        axr.set_ylabel("累计金额（百万元）", fontsize=11, color="red")
+        axr.set_ylabel("累计金额(百万元)", fontsize=11, color="red")
         axr.tick_params(axis="y", labelcolor="red")
 
         x_lo = float(min(xs)) - 12 / 24
@@ -1282,7 +1315,7 @@ class AnalyzeChart(BaseChart):
 
         def provider(i):
             m = marks[i]
-            note = "（自数据起点起算，区间不完整）" if m["partial"] else ""
+            note = "(自数据起点起算，区间不完整)" if m["partial"] else ""
             return [
                 f"{m['value'] / MILLION_STEP:.0f} 百万元里程碑",
                 f"跨越时刻: {m['ts']:%Y-%m-%d %H:%M}",
