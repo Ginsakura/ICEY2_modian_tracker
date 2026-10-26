@@ -730,9 +730,18 @@ class AnalyzeChart(BaseChart):
     GRAN_APPLIES = (VIEW_GROWTH, VIEW_ARPU)
 
     FIG_SIZE = (15.0, 9.0)
-    PLOT_L, PLOT_R = 0.19, 0.915                # 右边界外扩，压缩与窗口边框的留白
-    PLOT_B, PLOT_T = 0.115, 0.952               # 上边界外扩，压缩与窗口边框的留白
-    PANEL_GAP = 0.02                            # 上下子图之间的留白
+    PLOT_L, PLOT_R = 0.19, 0.915                # 右边界外扩，压缩与窗口边框的留白；左边界实际取
+                                                # max(PLOT_L, 左侧控件列 + 轴标签列)，见 plot_l()
+    PLOT_B, PLOT_T = 0.145, 0.952               # 上边界外扩，压缩与窗口边框的留白；下边界留足
+                                                # "刻度标签 + 时间轴标题 + 时间窗口滑块" 三层高度
+    PANEL_GAP = 0.02                            # 上下子图之间的最小留白(实际间距见 panel_gap())
+    TITLE_FONT_PT = 12                          # 双子图标题字号(点数)
+    TITLE_PAD_PT = 6.0                          # axes.titlepad 默认值(点数)
+    TICK_LEN_PT = 3.5                           # 刻度线向外伸出的长度(点数)
+    TICK_LABEL_IN = 0.90                        # 一个 "10-07 00:00" 刻度标签占用的横向宽度(英寸)
+    BOTTOM_MARGIN_IN = 1.30                     # 绘图区下边界到底边所需高度(英寸)
+    LEFT_MARGIN_IN = 0.90                       # 左侧 y 轴标题 + 刻度标签所需宽度(英寸)
+    CTRL_COL_R = 0.16                           # 左侧控件列(单选/勾选/按钮)的右边界(图宽比例)
     SLIDER_RECT = (0.215, 0.058, 0.62, 0.028)
     SNAP_RECT = (0.215, 0.014, 0.62, 0.028)
     DONUT_RECT = (0.645, 0.245, 0.30, 0.50)     # 正方形(width * 15 == height * 9)
@@ -852,8 +861,13 @@ class AnalyzeChart(BaseChart):
         self._ax_gran.set_title("聚合粒度" + ("" if gran_on else "(本视图不适用)"), fontsize=10, pad=2)
         self.check_tier.active = tier_on
         self._ax_tier.set_title("档位显隐" + ("" if tier_on else "(本视图不适用)"), fontsize=10, pad=2)
+        # 时间窗口滑块的"不适用"用整体变淡表示: 标签加长后缀会向左顶进档位显隐面板里
         self.slider_window.set_active(window_on)
-        self.slider_window.label.set_text("时间窗口" if window_on else "时间窗口(本视图不适用)")
+        self.slider_window.label.set_text("时间窗口")
+        dim = 1.0 if window_on else 0.3
+        for artist in (self.slider_window.label, self.slider_window.poly,
+                       self.slider_window.valtext, *self.slider_window._handles):
+            artist.set_alpha(dim)
         self.slider_snap.ax.set_visible(snap_on)
 
     def _sync_slider_text(self) -> None:
@@ -1019,15 +1033,49 @@ class AnalyzeChart(BaseChart):
 
     def _notice(self, text: str) -> None:
         """数据不足时的占位面板"""
-        ax = self.fig.add_axes((self.PLOT_L, self.PLOT_B, self.PLOT_R - self.PLOT_L, self.PLOT_T - self.PLOT_B))
+        ax = self.fig.add_axes((self.plot_l(), self.plot_b(), self.PLOT_R - self.plot_l(), self.PLOT_T - self.plot_b()))
         ax.set_xticks([])
         ax.set_yticks([])
         ax.text(0.5, 0.5, text, ha="center", va="center", fontsize=12, color="#666666")
         ax.set_title(self.state["view"], fontsize=13)
 
+    def plot_l(self) -> float:
+        """绘图区左边界(图宽比例)。
+
+        左边界左侧要依次排下 y 轴标题与刻度标签(以磅/英寸计，不随窗口缩放)，再往左是控件列。
+        固定比例在窄窗口或宽数值标签(如 "160,000")下会让刻度标签钻到控件面板底下被遮住，
+        因此按"控件列右边界 + 标签所需英寸数"换算。
+        """
+        w_in = self.fig.get_figwidth()
+        return min(0.34, max(self.PLOT_L, self.CTRL_COL_R + self.LEFT_MARGIN_IN / w_in))
+
+    def plot_b(self) -> float:
+        """绘图区下边界(图高比例)。
+
+        底部自上而下叠着 x 刻度标签、时间轴标题、时间窗口滑块、快照滑块。字号与滑块轨道高度
+        以磅/像素计、不随窗口缩放，若下边界用固定比例，窗口一变小时轴标题就会重新压到滑块上，
+        所以按"底部所需英寸数"换算成当前图高的比例。
+        """
+        return max(self.PLOT_B, self.BOTTOM_MARGIN_IN / self.fig.get_figheight())
+
+    def panel_gap(self) -> float:
+        """上下子图间距(图高比例)。
+
+        上子图关闭了刻度标签，但下子图标题画在自己顶部之上、上子图的刻度线也向下伸出，
+        固定的小间距会让标题压在上子图底边上。字号以磅为单位不随窗口缩放，而这里的坐标是
+        图高比例，所以按当前图高换算所需间距。
+        """
+        need_pt = self.TITLE_FONT_PT * 1.45 + self.TITLE_PAD_PT + self.TICK_LEN_PT + 4
+        return max(self.PANEL_GAP, need_pt / 72.0 / self.fig.get_figheight())
+
+    def time_maxticks(self, ax: Axes) -> int:
+        """按轴宽推算时间刻度上限，避免窄轴上的 "10-07 00:00" 标签彼此重叠"""
+        width_in = ax.get_position().width * self.fig.get_figwidth()
+        return max(3, min(11, int(width_in / self.TICK_LABEL_IN)))
+
     def _apply_time_axis(self, ax: Axes, xlim: Optional[tuple[Any, Any]] = None) -> None:
         """时序视图统一的时间轴样式(刻度水平放置，避免 30° 倾斜时伸入下方滑块区)"""
-        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=self.time_maxticks(ax)))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
         self.rotate_xlabels(ax, deg=0)
         if xlim:
@@ -1053,7 +1101,7 @@ class AnalyzeChart(BaseChart):
     # ---- 视图一: 基础趋势(复用 BaseChart 基础渲染)----
 
     def _draw_trend_view(self) -> None:
-        rect = (self.PLOT_L, self.PLOT_B, self.PLOT_R - self.PLOT_L, self.PLOT_T - self.PLOT_B)
+        rect = (self.plot_l(), self.plot_b(), self.PLOT_R - self.plot_l(), self.PLOT_T - self.plot_b())
         ax1 = self.fig.add_axes(rect)
         res = self.draw_trend(ax1, visible=self.state["visible"], xlim=self.window_xlim())
         self.rotate_xlabels(ax1, deg=0)       # draw_trend 内的 plt.xticks 面向 figure 当前轴，此处显式拉平
@@ -1075,11 +1123,11 @@ class AnalyzeChart(BaseChart):
             self._notice("聚合后无有效数据点，无法计算增速。")
             return
         x = mdates.date2num(xs)
-        w = self.PLOT_R - self.PLOT_L
+        w = self.PLOT_R - self.plot_l()
         top_p = self.PLOT_T
-        ax_p = self.fig.add_axes((self.PLOT_L, top_p - 0.395, w, 0.395))
-        top_m = top_p - 0.395 - self.PANEL_GAP
-        ax_m = self.fig.add_axes((self.PLOT_L, self.PLOT_B, w, top_m - self.PLOT_B), sharex=ax_p)
+        ax_p = self.fig.add_axes((self.plot_l(), top_p - 0.395, w, 0.395))
+        top_m = top_p - 0.395 - self.panel_gap()
+        ax_m = self.fig.add_axes((self.plot_l(), self.plot_b(), w, top_m - self.plot_b()), sharex=ax_p)
         ax_p.xaxis.set_tick_params(labelbottom=False)
         gran = self.GRAN_LABELS[self.state["gran"]]
 
@@ -1126,7 +1174,8 @@ class AnalyzeChart(BaseChart):
             self._notice("档位数据不可用，无法计算占比。")
             return
         x = mdates.date2num(xs)
-        ax = self.fig.add_axes((self.PLOT_L, self.PLOT_B, 0.44, self.PLOT_T - self.PLOT_B))
+        stack_w = max(0.30, self.DONUT_RECT[0] - 0.02 - self.plot_l())
+        ax = self.fig.add_axes((self.plot_l(), self.plot_b(), stack_w, self.PLOT_T - self.plot_b()))
         # 显式指定颜色，保证隐藏档位后其余档位配色不变(与基础趋势图一致)
         ax.stackplot(x, *series,
                      labels=labels, colors=[self.tier_color(c) for c in labels],
@@ -1216,13 +1265,13 @@ class AnalyzeChart(BaseChart):
             self._notice("聚合后无有效数据点，无法计算客单价。")
             return
         x = mdates.date2num(xs)
-        w = self.PLOT_R - self.PLOT_L
+        w = self.PLOT_R - self.plot_l()
         gran = self.GRAN_LABELS[self.state["gran"]]
         # 上: 边际客单价(新用户实际支付水平)叠加档位价格参考线
         # 下: 累计客单价单独放大，避免与 42~598 元的价格线量纲互相压平
-        ax_m = self.fig.add_axes((self.PLOT_L, self.PLOT_T - 0.425, w, 0.425))
-        top_c = self.PLOT_T - 0.425 - self.PANEL_GAP
-        ax_c = self.fig.add_axes((self.PLOT_L, self.PLOT_B, w, top_c - self.PLOT_B), sharex=ax_m)
+        ax_m = self.fig.add_axes((self.plot_l(), self.PLOT_T - 0.425, w, 0.425))
+        top_c = self.PLOT_T - 0.425 - self.panel_gap()
+        ax_c = self.fig.add_axes((self.plot_l(), self.plot_b(), w, top_c - self.plot_b()), sharex=ax_m)
         ax_m.xaxis.set_tick_params(labelbottom=False)
 
         prices = self.tier_prices()
@@ -1293,7 +1342,7 @@ class AnalyzeChart(BaseChart):
         if not marks:
             self._notice("未找到可用的金额数据，无法计算里程碑节奏。")
             return
-        rect = (self.PLOT_L, self.PLOT_B, self.PLOT_R - self.PLOT_L, self.PLOT_T - self.PLOT_B)
+        rect = (self.plot_l(), self.plot_b(), self.PLOT_R - self.plot_l(), self.PLOT_T - self.plot_b())
         ax = self.fig.add_axes(rect)
         axr = ax.twinx()
         xs = mdates.date2num([m["ts"] for m in marks])

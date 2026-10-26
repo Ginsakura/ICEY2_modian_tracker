@@ -1,8 +1,11 @@
 .venv/
 __pycache__/
 logs/
-**/*.log
-.git_sync_state.json
 .trae/
+.preview/
+
+**/*.log
+
+.git_sync_state.json
 *.pid
 
