@@ -963,3 +963,4 @@
 {"record":"event","seq":965,"time":1792993500379,"type":"step/end","turn":1,"step":139}
 {"record":"event","seq":966,"time":1792993501695,"type":"workspace/changes"}
 {"record":"event","seq":967,"time":1792993501696,"type":"turn/end","turn":1,"reason":"completed"}
+{"record":"event","seq":968,"time":1792998052008,"type":"model/selection"}
