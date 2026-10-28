@@ -1861,6 +1861,22 @@ class AnalyzeChart(BaseChart):
 
     # ---- 视图八: 日内节律(日 × 时热力图)----
 
+    @staticmethod
+    def _rhythm_cursor_text(data) -> str:
+        """热力图状态栏悬停文本。
+
+        绕开 matplotlib 3.11 对 TwoSlopeNorm 的格式化缺陷：最热格归一化后恰为
+        1.0，`_sig_digits_from_norm` 会取到 `inverse(>1)` 的 +inf，delta=inf 后
+        `math.floor(math.log10(inf))` 抛 OverflowError（悬停最热格必现）。
+        """
+        if np.ma.is_masked(data):
+            return ""
+        try:
+            value = float(data)
+        except (TypeError, ValueError):
+            return ""
+        return f"{value:.1f}%" if math.isfinite(value) else ""
+
     def _draw_rhythm_view(self) -> None:
         lo, hi = self.window_bounds()
         res = self.rhythm_matrix(lo, hi)
@@ -1882,6 +1898,7 @@ class AnalyzeChart(BaseChart):
         cmap = plt.get_cmap("RdBu_r").copy()
         cmap.set_bad("#e6e6e6")
         im = ax.imshow(masked, aspect="auto", cmap=cmap, norm=norm, interpolation="nearest")
+        im.format_cursor_data = self._rhythm_cursor_text
         ax.set_yticks(np.arange(len(days)))
         ax.set_yticklabels([f"{d:%m-%d}" for d in days])
         ax.set_xticks(np.arange(0, 24, 2))
@@ -1892,6 +1909,9 @@ class AnalyzeChart(BaseChart):
         ax.tick_params(axis="y", labelsize=7)
         cax = self.fig.add_axes((self.PLOT_R + 0.006, self.PLOT_T - top_h, 0.012, top_h))
         self.fig.colorbar(im, cax=cax, label="占当日 %")
+        # 色条上悬停同样会走 TwoSlopeNorm 的格式化路径（含归一化到 1.0 的顶端值）
+        for artist in cax.get_children():
+            artist.format_cursor_data = self._rhythm_cursor_text
         cax.tick_params(labelsize=7)
 
         axm = self.fig.add_axes(
