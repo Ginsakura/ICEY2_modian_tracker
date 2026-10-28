@@ -7,7 +7,7 @@
 
     BaseChart        数据加载 + 基础趋势渲染 + 十字跟踪 tooltip，供两种用法复用
       ├─ PlotChart       --plot: 渲染后直接显示，输出与重构前逐像素一致
-      └─ AnalyzeChart    --analyze: 五个视图 + matplotlib 原生控件 + 数据实时更新
+      └─ AnalyzeChart    --analyze: 九个视图 + matplotlib 原生控件 + 数据实时更新
 """
 import csv
 import logging
@@ -15,7 +15,7 @@ import math
 import os
 import re
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from types import FunctionType, MethodType
 
 import matplotlib.dates as mdates
@@ -24,6 +24,7 @@ import matplotlib.ticker as mticker
 import numpy as np
 
 from matplotlib.axes import Axes
+from matplotlib.colors import TwoSlopeNorm
 from matplotlib.figure import Figure
 from matplotlib.text import Text
 from matplotlib.lines import Line2D
@@ -59,6 +60,17 @@ MILESTONE_STYLE: dict[str, MilestoneStyle] = {
     "million": {"linestyle": "--", "color": "#4B0082"},      # 深靛紫虚线
     "tenmillion": {"linestyle": "-", "color": "#000000"},    # 黑色实线
 }
+
+# 众筹阶段切分(按日增金额的阶段特征人工划分): (名称, 起始日, 结束日(不含))
+# 数据起点 10-05 22:00 属预热段，阶段判定自 10-06 起；截止时刻见 DEADLINE
+CAMPAIGN_PHASES: tuple[tuple[str, date, date], ...] = (
+    ("P1 起势", date(2026, 10, 5), date(2026, 10, 8)),
+    ("P2 退坡", date(2026, 10, 8), date(2026, 10, 15)),
+    ("P3 二次脉冲", date(2026, 10, 15), date(2026, 10, 18)),
+    ("P4 断崖", date(2026, 10, 18), date(2026, 10, 23)),
+    ("P5 长尾", date(2026, 10, 23), date(2026, 11, 16)),
+)
+DEADLINE: datetime = datetime(2026, 11, 15, 23, 59)
 
 # --plot 时间轴左边界(十周年《艾希》续作众筹起始时刻)，右边界为末点 + 10 分钟
 PLOT_X_LEFT: datetime = datetime(2026, 10, 5, 22, 0)
@@ -491,6 +503,271 @@ class BaseChart:
             partial = False
         return marks
 
+    # ---------------- 分析助手(新视图共用) ----------------
+
+    RHYTHM_GAP_SECONDS: int = 300        # 相邻采样跨度超过该值视为断采，不参与小时归属
+    FINALE_FIT_DAYS: int = 7             # 终局外推拟合的完整自然日数
+
+    def rows_between(self, lo: Optional[datetime] = None,
+                     hi: Optional[datetime] = None) -> list[tuple[datetime, list[str]]]:
+        """返回时间区间 [lo, hi] 内的采样行(含端点)；两端为 None 表示不限"""
+        if lo is None and hi is None:
+            return list(self.parsed)
+        out: list[tuple[datetime, list[str]]] = []
+        for ts, row in self.parsed:
+            if lo is not None and ts < lo:
+                continue
+            if hi is not None and ts > hi:
+                continue
+            out.append((ts, row))
+        return out
+
+    def daily_totals(self, lo: Optional[datetime] = None,
+                     hi: Optional[datetime] = None) -> list[dict[str, Any]]:
+        """按自然日汇总日增(跨日末值差)。
+
+        缺整日时跳过该段，不把多日累计摊到一天；partial=True 表示当日末采早于
+        23 点(当日增量不完整，不参与终局拟合)。日内断采不影响跨日末值差：累计值
+        本身连续，只要前一日有末值，差值就覆盖整段变化。
+        """
+        rows = self.rows_between(lo, hi)
+        last: dict[date, tuple[float, float, datetime]] = {}
+        for ts, row in rows:
+            p = self.cell(row, "总人数")
+            m = self.cell(row, "总金额")
+            if math.isnan(p) and math.isnan(m):
+                continue
+            last[ts.date()] = (p, m, ts)
+        out: list[dict[str, Any]] = []
+        days = sorted(last)
+        for prev_day, day in zip(days, days[1:]):
+            if (day - prev_day).days != 1:
+                continue
+            p0, m0, _ = last[prev_day]
+            p1, m1, ts1 = last[day]
+            if math.isnan(p0) or math.isnan(p1) or math.isnan(m0) or math.isnan(m1):
+                continue
+            out.append({
+                "date": day,
+                "people": p1 - p0,
+                "money": m1 - m0,
+                "partial": ts1.hour < 23,
+            })
+        return out
+
+    def flow_buckets(self, seconds: Optional[int] = None, lo: Optional[datetime] = None,
+                     hi: Optional[datetime] = None) -> dict[str, list]:
+        """按桶汇总毛增 / 回吐 / 净增；正负增量先在原始相邻采样上判定，再按桶累加"""
+        rows = self.rows_between(lo, hi)
+        keys: list[float] = []
+        agg: list[list[float]] = []
+        for (prev_ts, prev_row), (ts, row) in zip(rows, rows[1:]):
+            if (ts - prev_ts).total_seconds() > self.RHYTHM_GAP_SECONDS:
+                continue        # 断采跨度的增量不属于任一桶，避免把 13 小时增量塞进一个点
+            key = float(math.floor(ts.timestamp() / seconds) * seconds) if seconds else float(ts.timestamp())
+            if not keys or key != keys[-1]:
+                keys.append(key)
+                agg.append([0.0] * 6)
+            slot = agg[-1]
+            dm = self.cell(row, "总金额") - self.cell(prev_row, "总金额")
+            if not math.isnan(dm):
+                if dm > 0:
+                    slot[0] += dm
+                else:
+                    slot[1] -= dm
+                slot[2] += dm
+            dp = self.cell(row, "总人数") - self.cell(prev_row, "总人数")
+            if not math.isnan(dp):
+                if dp > 0:
+                    slot[3] += dp
+                else:
+                    slot[4] -= dp
+                slot[5] += dp
+        return {
+            "xs": [datetime.fromtimestamp(k) for k in keys],
+            "gross_money": [a[0] for a in agg],
+            "void_money": [a[1] for a in agg],
+            "net_money": [a[2] for a in agg],
+            "gross_people": [a[3] for a in agg],
+            "void_people": [a[4] for a in agg],
+            "net_people": [a[5] for a in agg],
+        }
+
+    def void_rates(self, lo: Optional[datetime] = None,
+                   hi: Optional[datetime] = None) -> list[dict[str, Any]]:
+        """逐档位统计窗口内毛增份数、回吐份数与回吐率(毛增为 0 时 rate=None)"""
+        labels = self.stack_labels()
+        stats = {c: [0.0, 0.0] for c in labels}
+        rows = self.rows_between(lo, hi)
+        for (prev_ts, prev_row), (ts, row) in zip(rows, rows[1:]):
+            if (ts - prev_ts).total_seconds() > self.RHYTHM_GAP_SECONDS:
+                continue
+            for c in labels:
+                d = self.cell(row, c) - self.cell(prev_row, c)
+                if math.isnan(d):
+                    continue
+                if d > 0:
+                    stats[c][0] += d
+                elif d < 0:
+                    stats[c][1] -= d
+        return [
+            {"label": c, "gross": g, "void": v, "rate": (v / g) if g > 0 else None}
+            for c, (g, v) in stats.items()
+        ]
+
+    def marginal_share(self, seconds: Optional[int] = None, lo: Optional[datetime] = None,
+                       hi: Optional[datetime] = None
+                       ) -> tuple[list[datetime], list[str], list[list[float]], list[float]]:
+        """每桶各档毛增人数与份额；负增量不进分子，桶内毛增为 0 时该桶份额记 NaN"""
+        labels = self.stack_labels()
+        rows = self.rows_between(lo, hi)
+        keys: list[float] = []
+        xs: list[datetime] = []
+        matrix: list[list[float]] = []
+        totals: list[float] = []
+        for (prev_ts, prev_row), (ts, row) in zip(rows, rows[1:]):
+            if (ts - prev_ts).total_seconds() > self.RHYTHM_GAP_SECONDS:
+                continue        # 断采跨度的增量不属于任一桶，避免把 13 小时增量塞进一个点
+            key = float(math.floor(ts.timestamp() / seconds) * seconds) if seconds else float(ts.timestamp())
+            if not keys or key != keys[-1]:
+                keys.append(key)
+                xs.append(datetime.fromtimestamp(key))
+                matrix.append([0.0] * len(labels))
+                totals.append(0.0)
+            slot = matrix[-1]
+            for k, c in enumerate(labels):
+                d = self.cell(row, c) - self.cell(prev_row, c)
+                if not math.isnan(d) and d > 0:
+                    slot[k] += d
+                    totals[-1] += d
+        for slot, total in zip(matrix, totals):
+            for k in range(len(labels)):
+                slot[k] = slot[k] / total * 100.0 if total > 0 else float("nan")
+        return xs, labels, matrix, totals
+
+    def cumulative_share(self, lo: Optional[datetime] = None,
+                         hi: Optional[datetime] = None) -> tuple[list[str], list[float]]:
+        """窗口末各档占档位人数总和的累计份额(%)"""
+        labels = self.stack_labels()
+        rows = self.rows_between(lo, hi)
+        if not rows:
+            return labels, [float("nan")] * len(labels)
+        _, row = rows[-1]
+        sums = []
+        for c in labels:
+            v = self.cell(row, c)
+            sums.append(0.0 if math.isnan(v) or v < 0 else v)
+        total = sum(sums)
+        if total <= 0:
+            return labels, [float("nan")] * len(labels)
+        return labels, [v / total * 100.0 for v in sums]
+
+    def rhythm_matrix(self, lo: Optional[datetime] = None,
+                      hi: Optional[datetime] = None) -> dict[str, Any]:
+        """日 × 时金额增量百分比矩阵(按日归一)、缺采掩码、小时均值与峰值/负值小时"""
+        rows = self.rows_between(lo, hi)
+        days: list[date] = sorted({ts.date() for ts, _ in rows})
+        if not days:
+            return {"days": [], "matrix": [], "mean": [float("nan")] * 24,
+                    "peak_hour": None, "negative_hours": []}
+        day_idx = {d: i for i, d in enumerate(days)}
+        sums = [[0.0] * 24 for _ in days]
+        seen = [[False] * 24 for _ in days]
+        for (prev_ts, prev_row), (ts, row) in zip(rows, rows[1:]):
+            if (ts - prev_ts).total_seconds() > self.RHYTHM_GAP_SECONDS:
+                continue
+            dm = self.cell(row, "总金额") - self.cell(prev_row, "总金额")
+            if math.isnan(dm):
+                continue
+            i, h = day_idx[ts.date()], ts.hour
+            sums[i][h] += dm
+            seen[i][h] = True
+        matrix: list[list[float]] = []
+        for i in range(len(days)):
+            total = sum(sums[i][h] for h in range(24) if seen[i][h])
+            matrix.append([
+                (sums[i][h] / total * 100.0) if (seen[i][h] and total > 0) else float("nan")
+                for h in range(24)
+            ])
+        mean: list[float] = []
+        for h in range(24):
+            vals = [matrix[i][h] for i in range(len(days)) if not math.isnan(matrix[i][h])]
+            mean.append(sum(vals) / len(vals) if vals else float("nan"))
+        valid = [(v, h) for h, v in enumerate(mean) if not math.isnan(v)]
+        peak = max(valid)[1] if valid else None
+        return {
+            "days": days, "matrix": matrix, "mean": mean, "peak_hour": peak,
+            "negative_hours": [h for h, v in enumerate(mean) if not math.isnan(v) and v < 0],
+        }
+
+    def finale_forecast(self, fit_days: int = FINALE_FIT_DAYS,
+                        deadline: datetime = DEADLINE) -> dict[str, Any]:
+        """用最近若干完整自然日的日增做线性/对数线性拟合，外推到截止时刻"""
+        if len(self.parsed) < 2:
+            return {"forecast": False, "reason": "数据点不足"}
+        end_ts = self.parsed[-1][0]
+        money = self.col_values("总金额")
+        valid = [v for v in money if not math.isnan(v)]
+        if not valid:
+            return {"forecast": False, "reason": "缺少金额数据"}
+        current = valid[-1]
+        if end_ts >= deadline:
+            return {"forecast": False, "reason": "数据末行已过截止时刻"}
+        future_days = (deadline.date() - end_ts.date()).days
+        if future_days <= 0:
+            return {"forecast": False, "reason": "今日截止，不足一日可外推"}
+        daily = [d for d in self.daily_totals() if not d["partial"]]
+        fit = daily[-fit_days:]
+        if len(fit) < 3:
+            return {"forecast": False, "reason": f"完整自然日不足 3 天(当前 {len(fit)} 天)"}
+        values = np.asarray([d["money"] for d in fit], dtype=float)
+        if not np.all(np.isfinite(values)):
+            return {"forecast": False, "reason": "日增金额含无效值"}
+        t = np.arange(len(values), dtype=float)
+        mean_rate = float(np.mean(values))
+        future = t[-1] + np.arange(1, future_days + 1, dtype=float)
+        lin_pred = np.full_like(future, max(mean_rate, 0.0))
+        dates = [datetime.combine(end_ts.date(), datetime.min.time()) + timedelta(days=int(k))
+                 for k in range(1, future_days + 1)]
+        lin_cum = [float(v) for v in current + np.cumsum(lin_pred)]
+        if bool(np.all(values > 0)):
+            be, ae = np.polyfit(t, np.log(values), 1)
+            exp_pred = np.exp(ae + be * future)
+            exp_cum = [float(v) for v in current + np.cumsum(exp_pred)]
+        else:
+            exp_pred = lin_pred
+            exp_cum = list(lin_cum)
+        lo_total = float(min(lin_cum[-1], exp_cum[-1]))
+        hi_total = float(max(lin_cum[-1], exp_cum[-1]))
+
+        milestone = None
+        target = (math.floor(current / MILLION_STEP) + 1) * MILLION_STEP
+        if target <= hi_total:
+            remain = target - current
+            r_fast = max(float(lin_pred[0]), float(exp_pred[0]))
+            r_slow = min(float(lin_pred[0]), float(exp_pred[0]))
+            if r_fast > 0:
+                d_fast = remain / r_fast
+                d_slow = remain / r_slow if r_slow > 0 else d_fast * 3
+                milestone = {
+                    "value": float(target),
+                    "eta_lo": end_ts + timedelta(days=d_fast),
+                    "eta_hi": end_ts + timedelta(days=d_slow),
+                }
+        return {
+            "forecast": True,
+            "daily": fit,
+            "current": float(current),
+            "future_dates": [end_ts] + dates,
+            "lin_cum": [float(current)] + lin_cum,
+            "exp_cum": [float(current)] + exp_cum,
+            "lin_total": float(lin_cum[-1]),
+            "exp_total": float(exp_cum[-1]),
+            "band": (lo_total, hi_total),
+            "deadline": deadline,
+            "next_milestone": milestone,
+        }
+
     # ---------------- 绘图层 ----------------
 
     @staticmethod
@@ -712,7 +989,7 @@ class PlotChart(BaseChart):
 class AnalyzeChart(BaseChart):
     """--analyze: 交互式分析窗口。
 
-    基础绘图复用 BaseChart.render 产物; 在此基础上提供五个视图与
+    基础绘图复用 BaseChart.render 产物; 在此基础上提供九个视图与
     matplotlib 原生控件(视图切换 / 时间窗口 / 聚合粒度 / 档位显隐 / 重置)，
     并轮询 CSV 变化以保留控件状态实时重绘。
     """
@@ -722,12 +999,20 @@ class AnalyzeChart(BaseChart):
     VIEW_SHARE = "档位结构占比"
     VIEW_ARPU = "客单价指标"
     VIEW_MILESTONE = "里程碑节奏"
-    VIEWS = (VIEW_TREND, VIEW_GROWTH, VIEW_SHARE, VIEW_ARPU, VIEW_MILESTONE)
+    VIEW_FLOW = "净流拆解"
+    VIEW_MARGIN = "边际结构"
+    VIEW_RHYTHM = "日内节律"
+    VIEW_FINALE = "终局与阶段"
+    VIEWS = (
+        VIEW_TREND, VIEW_GROWTH, VIEW_SHARE, VIEW_ARPU, VIEW_MILESTONE,
+        VIEW_FLOW, VIEW_MARGIN, VIEW_RHYTHM, VIEW_FINALE,
+    )
 
     GRAN_LABELS = ("原始", "10分钟", "1小时")
     GRAN_SECONDS = (None, 600, 3600)
     GRAN_DEFAULT = 1                 # 默认 10 分钟聚合: 增速/客单价噪声与细节的折中
-    GRAN_APPLIES = (VIEW_GROWTH, VIEW_ARPU)
+    GRAN_APPLIES = (VIEW_GROWTH, VIEW_ARPU, VIEW_FLOW, VIEW_MARGIN)
+    TIER_APPLIES = (VIEW_TREND, VIEW_SHARE, VIEW_FLOW, VIEW_MARGIN)
 
     FIG_SIZE = (15.0, 9.0)
     PLOT_L, PLOT_R = 0.19, 0.915                # 右边界外扩，压缩与窗口边框的留白；左边界实际取
@@ -795,10 +1080,10 @@ class AnalyzeChart(BaseChart):
             return ax
 
         # 视图切换
-        self._ax_view = ctrl_ax((0.015, 0.63, 0.145, 0.255))
+        self._ax_view = ctrl_ax((0.015, 0.60, 0.145, 0.285))
         self._ax_view.set_title("视图", fontsize=10, pad=2)
         self.radio_view = RadioButtons(
-            self._ax_view, list(self.VIEWS), active=0, label_props={"fontsize": [9]},
+            self._ax_view, list(self.VIEWS), active=0, label_props={"fontsize": [8]},
         )
         self.radio_view.on_clicked(self._on_view_change)
 
@@ -851,7 +1136,7 @@ class AnalyzeChart(BaseChart):
         """按当前视图标注各控件是否适用(不适用则置灰并停用交互)"""
         view = self.state["view"]
         gran_on = view in self.GRAN_APPLIES
-        tier_on = view in (self.VIEW_TREND, self.VIEW_SHARE)
+        tier_on = view in self.TIER_APPLIES
         window_on = view != self.VIEW_MILESTONE
         snap_on = view == self.VIEW_SHARE
 
@@ -906,7 +1191,7 @@ class AnalyzeChart(BaseChart):
             return
         for lb, on in zip(self._tier_labels, self.check_tier.get_status()):
             self.state["visible"][lb] = bool(on)
-        if self.state["view"] in (self.VIEW_TREND, self.VIEW_SHARE):
+        if self.state["view"] in self.TIER_APPLIES:
             self.render_view()
 
     def _on_window_change(self, val: tuple) -> None:
@@ -1031,6 +1316,15 @@ class AnalyzeChart(BaseChart):
             float(mdates.date2num(self.parsed[hi][0])) + (X_RIGHT_PAD if pad else 0)
         )
 
+    def window_bounds(self) -> tuple[datetime, datetime]:
+        """当前时间窗口的起止时刻(闭区间)，供新视图按时间切片"""
+        lo, hi = self.state["window"]
+        if not self.parsed:
+            return datetime.min, datetime.max
+        lo = min(max(lo, 0), len(self.parsed) - 1)
+        hi = min(max(hi, 0), len(self.parsed) - 1)
+        return self.parsed[lo][0], self.parsed[hi][0]
+
     def _notice(self, text: str) -> None:
         """数据不足时的占位面板"""
         ax = self.fig.add_axes((self.plot_l(), self.plot_b(), self.PLOT_R - self.plot_l(), self.PLOT_T - self.plot_b()))
@@ -1068,6 +1362,14 @@ class AnalyzeChart(BaseChart):
         need_pt = self.TITLE_FONT_PT * 1.45 + self.TITLE_PAD_PT + self.TICK_LEN_PT + 4
         return max(self.PANEL_GAP, need_pt / 72.0 / self.fig.get_figheight())
 
+    def stack_gap(self) -> float:
+        """上下子图分属不同坐标系(上为时间轴、下为分类轴)时的间距。
+
+        上子图保留 x 刻度标签、下子图标题画在自身顶部，两者都要挤在子图之间，
+        因此比 panel_gap() 再留出约 0.045 图高。
+        """
+        return max(self.panel_gap() + 0.045, 0.05)
+
     def time_maxticks(self, ax: Axes) -> int:
         """按轴宽推算时间刻度上限，避免窄轴上的 "10-07 00:00" 标签彼此重叠"""
         width_in = ax.get_position().width * self.fig.get_figwidth()
@@ -1085,16 +1387,18 @@ class AnalyzeChart(BaseChart):
         """清空绘图区并按当前状态重绘选中视图，随后同步控件可用状态"""
         self._clear_view_axes()
         view = self.state["view"]
-        if view == self.VIEW_TREND:
-            self._draw_trend_view()
-        elif view == self.VIEW_GROWTH:
-            self._draw_growth_view()
-        elif view == self.VIEW_SHARE:
-            self._draw_share_view()
-        elif view == self.VIEW_ARPU:
-            self._draw_arpu_view()
-        else:
-            self._draw_milestone_view()
+        drawers = {
+            self.VIEW_TREND: self._draw_trend_view,
+            self.VIEW_GROWTH: self._draw_growth_view,
+            self.VIEW_SHARE: self._draw_share_view,
+            self.VIEW_ARPU: self._draw_arpu_view,
+            self.VIEW_MILESTONE: self._draw_milestone_view,
+            self.VIEW_FLOW: self._draw_flow_view,
+            self.VIEW_MARGIN: self._draw_margin_view,
+            self.VIEW_RHYTHM: self._draw_rhythm_view,
+            self.VIEW_FINALE: self._draw_finale_view,
+        }
+        drawers.get(view, self._draw_trend_view)()
         self._sync_control_state()
         self.fig.canvas.draw_idle()
 
@@ -1400,4 +1704,335 @@ class AnalyzeChart(BaseChart):
         self.cursor.bind(
             panels=[axr], anchor_ax=axr,
             x_arr=xs, anchor_y=np.asarray(anchor_y, dtype=float), provider=provider,
+        )
+
+    # ---- 新视图共用: 档位标签压缩 ----
+
+    @staticmethod
+    def _short_tier(label: str) -> str:
+        """把 "Lv2（￥45.6）" 压缩成 "Lv2 ￥45.6"，给横条图左侧刻度留出空间"""
+        if label == "无偿支持":
+            return label
+        m = re.match(r"(Lv\d+)（￥([\d.]+)）", label)
+        return f"{m.group(1)} ￥{m.group(2)}" if m else label
+
+    # ---- 视图六: 净流拆解(毛增 / 回吐 / 净增)----
+
+    def _draw_flow_view(self) -> None:
+        sec = self.GRAN_SECONDS[self.state["gran"]]
+        lo, hi = self.window_bounds()
+        flow = self.flow_buckets(sec, lo, hi)
+        if len(flow["xs"]) < 2:
+            self._notice("窗口内有效采样不足，无法计算净流。")
+            return
+        gran = self.GRAN_LABELS[self.state["gran"]]
+        x = mdates.date2num(flow["xs"])
+        w = self.PLOT_R - self.plot_l()
+        top_h = 0.40
+        ax = self.fig.add_axes((self.plot_l(), self.PLOT_T - top_h, w, top_h))
+        gross = np.asarray(flow["gross_money"], dtype=float)
+        void = np.asarray(flow["void_money"], dtype=float)
+        net = np.asarray(flow["net_money"], dtype=float)
+        ax.fill_between(x, 0, gross, step="post", color="#2ca02c", alpha=0.30, linewidth=0)
+        ax.plot(x, gross, color="#2ca02c", linewidth=1.0, label="毛增")
+        ax.plot(x, -void, color="#d62728", linewidth=1.0, label="回吐(负值)")
+        ax.fill_between(x, 0, -void, step="post", color="#d62728", alpha=0.22, linewidth=0)
+        ax.plot(x, net, color="#1f77b4", linewidth=1.5, label="净增")
+        ax.axhline(0, color="#666666", linewidth=0.8)
+        ax.set_ylabel("金额(元)", fontsize=10)
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_money))
+        total_gross = float(gross.sum())
+        total_void = float(void.sum())
+        rate = total_void / total_gross * 100.0 if total_gross > 0 else float("nan")
+        ax.set_title(
+            f"金额净流拆解({gran}聚合)：毛增 {total_gross / 1e4:,.0f}万 / 回吐 {total_void / 1e4:,.0f}万"
+            f" / 回吐率 {rate:.1f}%",
+            fontsize=12, fontweight="bold",
+        )
+        ax.grid(True, linestyle="--", alpha=0.35)
+        ax.legend(loc="upper right", fontsize=8, ncol=3)
+        self._apply_time_axis(ax, self.window_xlim())
+        self.attach_time_status(ax, " 元")
+
+        rates = [r for r in self.void_rates(lo, hi)
+                 if self.state["visible"].get(r["label"], True)]
+        axr = self.fig.add_axes(
+            (self.plot_l(), self.plot_b(), w, self.PLOT_T - top_h - self.stack_gap() - self.plot_b())
+        )
+        rated = [r for r in rates if r["rate"] is not None]
+        na = [r for r in rates if r["rate"] is None]
+        if rated:
+            rated.sort(key=lambda r: r["rate"])
+            ys = np.arange(len(rated))
+            axr.barh(ys, [r["rate"] * 100.0 for r in rated], height=0.62,
+                     color="#c44e52", alpha=0.85)
+            axr.set_yticks(ys, [self._short_tier(r["label"]) for r in rated])
+            for y, r in zip(ys, rated):
+                axr.text(r["rate"] * 100.0 + 0.6, y, f"{r['rate'] * 100:.1f}%",
+                         va="center", fontsize=8, color="#333333")
+            span = max(r["rate"] for r in rated) * 100.0
+            axr.set_xlim(0, span * 1.25 if span > 0 else 1.0)
+        else:
+            axr.text(0.5, 0.5, "窗口内无回吐记录", ha="center", va="center",
+                     transform=axr.transAxes, fontsize=10, color="#666666")
+            axr.set_yticks([])
+        note = f"；无毛增档位 {len(na)} 个(记 N/A)" if na else ""
+        axr.set_title(f"各档位回吐率(窗口合计，回吐/毛增){note}", fontsize=12, fontweight="bold")
+        axr.set_xlabel("回吐率(%)", fontsize=10)
+        axr.grid(True, axis="x", linestyle="--", alpha=0.35)
+        axr.tick_params(axis="y", labelsize=8)
+
+        def provider(i):
+            return [
+                f"{flow['xs'][i]:%Y-%m-%d %H:%M}",
+                f"毛增: {gross[i]:,.2f} 元",
+                f"回吐: {void[i]:,.2f} 元",
+                f"净增: {net[i]:+,.2f} 元",
+            ]
+
+        self.cursor.bind(panels=[ax], anchor_ax=ax, x_arr=x, anchor_y=net, provider=provider)
+
+    # ---- 视图七: 边际结构(Δ 口径份额 vs 累计份额)----
+
+    def _draw_margin_view(self) -> None:
+        sec = self.GRAN_SECONDS[self.state["gran"]]
+        lo, hi = self.window_bounds()
+        xs, labels, matrix, totals = self.marginal_share(sec, lo, hi)
+        if len(xs) < 2:
+            self._notice("窗口内有效采样不足，无法计算边际份额。")
+            return
+        keep = [k for k, c in enumerate(labels) if self.state["visible"].get(c, True)]
+        if not keep:
+            self._notice("所有档位都被隐藏，无可绘制的边际份额。")
+            return
+        gran = self.GRAN_LABELS[self.state["gran"]]
+        x = mdates.date2num(xs)
+        w = self.PLOT_R - self.plot_l()
+        top_h = 0.44
+        ax = self.fig.add_axes((self.plot_l(), self.PLOT_T - top_h, w, top_h))
+        series = [np.asarray([matrix[i][k] for i in range(len(xs))], dtype=float) for k in keep]
+        ax.stackplot(x, *series, colors=[self.tier_color(labels[k]) for k in keep],
+                     labels=[labels[k] for k in keep], alpha=0.95)
+        ax.set_ylim(0, 100)
+        ax.set_ylabel("毛增份额(%)", fontsize=10)
+        ax.set_title(f"边际档位结构({gran}聚合，仅计正向增量)", fontsize=12, fontweight="bold")
+        ax.grid(True, linestyle="--", alpha=0.25)
+        ax.legend(loc="upper left", bbox_to_anchor=(1.004, 1.0), fontsize=6.5,
+                  frameon=False, handlelength=1.2, borderaxespad=0.0)
+        self._apply_time_axis(ax, self.window_xlim())
+        self.attach_time_status(ax, " %")
+
+        axr = self.fig.add_axes(
+            (self.plot_l(), self.plot_b(), w, self.PLOT_T - top_h - self.stack_gap() - self.plot_b())
+        )
+        _, cum = self.cumulative_share(lo, hi)
+        marg_win = []
+        for k in keep:
+            marg_win.append(sum(
+                matrix[i][k] / 100.0 * totals[i]
+                for i in range(len(xs)) if not math.isnan(matrix[i][k])
+            ))
+        total_marg = sum(marg_win)
+        marg_pct = [(m / total_marg * 100.0) if total_marg > 0 else float("nan") for m in marg_win]
+        order = sorted(range(len(keep)), key=lambda j: cum[keep[j]] if not math.isnan(cum[keep[j]]) else -1.0)
+        ys = np.arange(len(order))
+        cum_vals = [cum[keep[j]] for j in order]
+        marg_vals = [marg_pct[j] for j in order]
+        axr.barh(ys + 0.19, cum_vals, height=0.36, color="#4c72b0", label="累计份额(窗口末)")
+        axr.barh(ys - 0.19, marg_vals, height=0.36, color="#dd8452", label="边际份额(窗口毛增)")
+        axr.set_yticks(ys, [self._short_tier(labels[keep[j]]) for j in order])
+        tops = [v for v in cum_vals + marg_vals if not math.isnan(v)]
+        axr.set_xlim(0, (max(tops) if tops else 1.0) * 1.2)
+        axr.set_xlabel("份额(%)", fontsize=10)
+        axr.set_title("累计份额 vs 窗口边际份额", fontsize=12, fontweight="bold")
+        axr.grid(True, axis="x", linestyle="--", alpha=0.35)
+        axr.tick_params(axis="y", labelsize=8)
+        axr.legend(loc="lower right", fontsize=8)
+
+        def provider(i):
+            lines = [f"{xs[i]:%Y-%m-%d %H:%M}"]
+            for k in keep:
+                v = matrix[i][k]
+                lines.append(f"{labels[k]}: {'—' if math.isnan(v) else f'{v:.2f}%'}")
+            return lines
+
+        self.cursor.bind(panels=[ax], anchor_ax=ax, x_arr=x,
+                         anchor_y=np.zeros(len(x)), provider=provider)
+
+    # ---- 视图八: 日内节律(日 × 时热力图)----
+
+    def _draw_rhythm_view(self) -> None:
+        lo, hi = self.window_bounds()
+        res = self.rhythm_matrix(lo, hi)
+        days = res["days"]
+        if not days:
+            self._notice("窗口内没有可用的日内数据。")
+            return
+        w = self.PLOT_R - self.plot_l()
+        top_h = 0.46
+        ax = self.fig.add_axes((self.plot_l(), self.PLOT_T - top_h, w, top_h))
+        data = np.asarray(res["matrix"], dtype=float)
+        masked = np.ma.masked_invalid(data)
+        finite = data[np.isfinite(data)]
+        if finite.size:
+            vmin, vmax = float(finite.min()), float(finite.max())
+        else:
+            vmin, vmax = -0.1, 0.1
+        norm = TwoSlopeNorm(vmin=min(vmin, -0.1), vcenter=0.0, vmax=max(vmax, 0.1))
+        cmap = plt.get_cmap("RdBu_r").copy()
+        cmap.set_bad("#e6e6e6")
+        im = ax.imshow(masked, aspect="auto", cmap=cmap, norm=norm, interpolation="nearest")
+        ax.set_yticks(np.arange(len(days)))
+        ax.set_yticklabels([f"{d:%m-%d}" for d in days])
+        ax.set_xticks(np.arange(0, 24, 2))
+        ax.set_xticklabels([f"{h:02d}" for h in range(0, 24, 2)])
+        ax.set_xlabel("小时", fontsize=10)
+        ax.set_ylabel("日期", fontsize=10)
+        ax.set_title("日内节律：每小时金额增量占当日比重(按日归一)", fontsize=12, fontweight="bold")
+        ax.tick_params(axis="y", labelsize=7)
+        cax = self.fig.add_axes((self.PLOT_R + 0.006, self.PLOT_T - top_h, 0.012, top_h))
+        self.fig.colorbar(im, cax=cax, label="占当日 %")
+        cax.tick_params(labelsize=7)
+
+        axm = self.fig.add_axes(
+            (self.plot_l(), self.plot_b(), w, self.PLOT_T - top_h - self.stack_gap() - self.plot_b())
+        )
+        mean = np.asarray(res["mean"], dtype=float)
+        axm.bar(np.arange(24), mean, color="#4c72b0", alpha=0.85)
+        axm.axhline(0, color="#666666", linewidth=0.8)
+        axm.set_xticks(np.arange(0, 24, 2))
+        axm.set_xticklabels([f"{h:02d}" for h in range(0, 24, 2)])
+        axm.set_xlabel("小时", fontsize=10)
+        axm.set_ylabel("占当日 %(日均)", fontsize=10)
+        peak = res["peak_hour"]
+        if peak is not None and not math.isnan(mean[peak]):
+            axm.annotate(f"峰值 {peak:02d} 时 {mean[peak]:.1f}%", (peak, mean[peak]),
+                         xytext=(8, 10), textcoords="offset points", fontsize=8, color="#c44e52")
+        neg = res["negative_hours"]
+        if neg:
+            axm.text(0.99, 0.02, "净流出小时: " + "、".join(f"{h:02d}" for h in neg),
+                     transform=axm.transAxes, ha="right", va="bottom",
+                     fontsize=8, color="#c44e52")
+        axm.set_title("小时均值(负值为净退款小时)", fontsize=12, fontweight="bold")
+        axm.grid(True, axis="y", linestyle="--", alpha=0.35)
+
+        def provider(i):
+            h = int(round(i))
+            n = int(np.isfinite(data[:, h]).sum()) if data.size else 0
+            return [f"{h:02d}:00~{h:02d}:59", f"日均占比: {mean[h]:.2f}%", f"有效天数: {n}"]
+
+        self.cursor.bind(panels=[axm], anchor_ax=axm, x_arr=np.arange(24, dtype=float),
+                         anchor_y=np.nan_to_num(mean), provider=provider)
+
+    # ---- 视图九: 终局与阶段(阶段节奏 + 终局外推)----
+
+    def _draw_finale_view(self) -> None:
+        lo, hi = self.window_bounds()
+        daily = self.daily_totals(lo, hi)
+        fc = self.finale_forecast()
+        if not daily:
+            self._notice("窗口内没有完整自然日的日增数据，无法绘制阶段节奏。")
+            return
+        cum_ts: list[datetime] = []
+        cum_money: list[float] = []
+        for ts, row in self.rows_between(lo, hi):
+            m = self.cell(row, "总金额")
+            if math.isnan(m):
+                continue
+            cum_ts.append(ts)
+            cum_money.append(m)
+        if not cum_money:
+            self._notice("窗口内没有有效金额数据。")
+            return
+        w = self.PLOT_R - self.plot_l()
+        top_h = 0.42
+        ax = self.fig.add_axes((self.plot_l(), self.PLOT_T - top_h, w, top_h))
+        x = [mdates.date2num(datetime.combine(d["date"], datetime.min.time())) for d in daily]
+        money = [d["money"] for d in daily]
+        ax.bar(x, money, width=0.8, color="#4c72b0", alpha=0.9, label="日增金额")
+        if len(money) >= 3:
+            ma = np.convolve(money, np.ones(3) / 3, mode="valid")
+            ax.plot(x[2:], ma, color="#d62728", linewidth=1.6, label="3 日均线")
+        for name, start, end in CAMPAIGN_PHASES:
+            x0 = mdates.date2num(datetime.combine(start, datetime.min.time()))
+            x1 = mdates.date2num(datetime.combine(end, datetime.min.time()))
+            ax.axvspan(x0, x1, color="#999999", alpha=0.07, zorder=0)
+            in_phase = [d for d in daily if start <= d["date"] < end]
+            if not in_phase:
+                continue
+            cx = sum(mdates.date2num(datetime.combine(d["date"], datetime.min.time()))
+                     for d in in_phase) / len(in_phase)
+            avg = sum(d["money"] for d in in_phase) / len(in_phase)
+            ax.annotate(f"{name} {avg / 1e4:,.0f}万/日", (cx, 1.0),
+                        xycoords=ax.get_xaxis_transform(), xytext=(0, 2),
+                        textcoords="offset points", ha="center", va="bottom",
+                        fontsize=7, color="#444444")
+        ax.axhline(0, color="#999999", linewidth=0.8, linestyle="--")
+        ax.set_ylabel("日增金额(元)", fontsize=10)
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_money))
+        lo_y = min(0.0, min(money))
+        hi_y = max(max(money), 1.0)
+        ax.set_ylim(lo_y * 1.15 if lo_y < 0 else 0, hi_y * 1.45)
+        ax.set_title("阶段节奏：日增金额与 3 日均线", fontsize=12, fontweight="bold", pad=14)
+        ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+        ax.legend(loc="upper right", fontsize=8)
+        ax.xaxis.set_tick_params(labelbottom=False)
+
+        axc = self.fig.add_axes(
+            (self.plot_l(), self.plot_b(), w, self.PLOT_T - top_h - self.stack_gap() - self.plot_b()),
+            sharex=ax,
+        )
+        cx = mdates.date2num(cum_ts)
+        axc.plot(cx, cum_money, color="red", linewidth=1.8, label="累计金额", zorder=3)
+        for _, start, end in CAMPAIGN_PHASES:
+            axc.axvspan(mdates.date2num(datetime.combine(start, datetime.min.time())),
+                        mdates.date2num(datetime.combine(end, datetime.min.time())),
+                        color="#999999", alpha=0.05, zorder=0)
+        if fc["forecast"]:
+            fx = mdates.date2num(fc["future_dates"])
+            lin_cum = np.asarray(fc["lin_cum"], dtype=float)
+            exp_cum = np.asarray(fc["exp_cum"], dtype=float)
+            axc.plot(fx, lin_cum, color="#1f77b4", linestyle="--", linewidth=1.3,
+                     label=f"线性外推 {fc['lin_total'] / 1e6:.2f}M", zorder=4)
+            axc.plot(fx, exp_cum, color="#2ca02c", linestyle=":", linewidth=1.4,
+                     label=f"指数外推 {fc['exp_total'] / 1e6:.2f}M", zorder=4)
+            axc.fill_between(fx, np.minimum(lin_cum, exp_cum), np.maximum(lin_cum, exp_cum),
+                             color="#777777", alpha=0.15, zorder=2)
+            dl = mdates.date2num(fc["deadline"])
+            axc.axvline(dl, color="#444444", linestyle="-.", linewidth=1.1, zorder=3)
+            axc.annotate("截止 11-15 23:59", (dl, 0.02), xycoords=("data", "axes fraction"),
+                         fontsize=8, ha="right", va="bottom", rotation=90, color="#444444")
+            nm = fc.get("next_milestone") or {}
+            if nm.get("value") and nm.get("eta_lo") is not None:
+                axc.axhline(nm["value"], color="#4B0082", linestyle="--", linewidth=0.9, zorder=2)
+                axc.text(0.16, nm["value"],
+                         f"{nm['value'] / MILLION_STEP:.0f}M 预计 {nm['eta_lo']:%m-%d}~{nm['eta_hi']:%m-%d}",
+                         transform=axc.get_yaxis_transform(), ha="left", va="bottom",
+                         fontsize=8, color="#4B0082")
+            xlim = (float(mdates.date2num(cum_ts[0])), mdates.date2num(fc["deadline"]) + 0.5)
+        else:
+            axc.text(0.02, 0.97, f"未外推: {fc['reason']}", transform=axc.transAxes,
+                     fontsize=9, color="#777777", va="top")
+            xlim = self.window_xlim()
+        axc.set_ylabel("累计金额(元)", fontsize=10, color="red")
+        axc.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_money))
+        axc.tick_params(axis="y", labelcolor="red")
+        axc.set_title("累计金额与终局外推", fontsize=12, fontweight="bold")
+        axc.grid(True, linestyle="--", alpha=0.35)
+        axc.set_xlabel("时间", fontsize=11)
+        axc.legend(loc="upper left", fontsize=8)
+        self._apply_time_axis(axc, xlim)
+        self.attach_time_status(axc, " 元")
+
+        def provider(i):
+            prev = cum_money[i - 1] if i else cum_money[i]
+            return [
+                f"{cum_ts[i]:%Y-%m-%d %H:%M}",
+                f"累计金额: {cum_money[i]:,.2f} 元",
+                f"较上一采样: {cum_money[i] - prev:+,.0f} 元",
+            ]
+
+        self.cursor.bind(
+            panels=[axc], anchor_ax=axc,
+            x_arr=np.asarray(cx), anchor_y=np.asarray(cum_money), provider=provider,
         )

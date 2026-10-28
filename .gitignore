@@ -3,6 +3,7 @@ __pycache__/
 logs/
 .trae/
 .preview/
+.dsh-ops/panel/
 
 **/*.log
 

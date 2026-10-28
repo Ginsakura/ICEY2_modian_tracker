@@ -8,6 +8,7 @@
 # ///
 import argparse
 import csv
+import io
 import os
 import re
 import threading
@@ -94,55 +95,190 @@ def _clean_cell(value):
     s = str(value).strip()
     return s[:-2] if s.endswith(".0") else s
 
-def _write_csv(rows, money_idx):
-    """写入 CSV（utf-8-sig）；时间戳与总金额保持原样，其余列去除 .0 后缀"""
-    with open(CSV_FILE, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.writer(f)
-        for row in rows:
-            cleaned = [
-                "" if cell is None else (cell if i == 0 or i == money_idx else _clean_cell(cell))
-                for i, cell in enumerate(row)
-            ]
-            writer.writerow(cleaned)
+_BOM: bytes = b"\xef\xbb\xbf"
+
+
+def _expected_header(data):
+    """本次采样应有的表头: 固定三列 + 页面返回的档位列（保持页面顺序）"""
+    return ["timestamp", "总人数", "总金额", *data.keys()]
+
+
+def _read_header(path=None):
+    """只读取 CSV 首行并解析为表头列表；文件缺失、为空或缺 BOM 时返回 None"""
+    path = path or CSV_FILE
+    try:
+        with open(path, "rb", buffering=0) as f:
+            first = f.readline()
+    except OSError:
+        return None
+    if not first or not first.startswith(_BOM):
+        return None
+    try:
+        return next(csv.reader([first.decode("utf-8-sig").rstrip("\r\n")]), None)
+    except (UnicodeDecodeError, csv.Error):
+        return None
+
+
+def _check_file_format(path=None):
+    """检查能否直接追加，返回 (表头, 状态)。
+
+    状态: missing 文件不存在 / empty 空文件 / no_bom 缺 BOM /
+          partial 末行不完整 / crlf 行尾不是 CRLF / ok 可直接追加。
+    常规追加只读取表头行与文件末尾 2 字节，不触碰历史数据行。
+    """
+    path = path or CSV_FILE
+    if not os.path.exists(path):
+        return None, "missing"
+    try:
+        with open(path, "rb", buffering=0) as f:
+            first = f.readline()
+            if not first:
+                return None, "empty"
+            if not first.startswith(_BOM):
+                return None, "no_bom"
+            size = os.fstat(f.fileno()).st_size
+            if size < 2:
+                return None, "partial"
+            f.seek(-2, os.SEEK_END)
+            tail = f.read(2)
+    except OSError:
+        return None, "missing"
+    try:
+        header = next(csv.reader([first.decode("utf-8-sig").rstrip("\r\n")]), None)
+    except (UnicodeDecodeError, csv.Error):
+        return None, "no_bom"
+    if not header:
+        return None, "empty"
+    if tail[1:] != b"\n":
+        return None, "partial"
+    if tail[0:1] != b"\r":
+        return None, "crlf"
+    return header, "ok"
+
+
+def _truncate_partial_line(path=None):
+    """末尾存在崩溃残留的半行时，截断到最后一个完整行；返回是否发生截断"""
+    path = path or CSV_FILE
+    try:
+        size = os.path.getsize(path)
+        if size == 0:
+            return False
+        with open(path, "rb+") as f:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) == b"\n":
+                return False
+            pos = size
+            new_size = 0
+            while pos > 0:
+                step = min(8192, pos)
+                pos -= step
+                f.seek(pos)
+                idx = f.read(step).rfind(b"\n")
+                if idx != -1:
+                    new_size = pos + idx + 1
+                    break
+            f.truncate(new_size)
+    except OSError:
+        logger.exception("修复 %s 的不完整末行失败", path)
+        return False
+    logger.warning("检测到 %s 末尾存在不完整行，已截断到 %d 字节", path, new_size)
+    return True
+
+
+def _format_row(header, data, total_count, total_money):
+    """按表头列序构造一行；未解析到的值写空字符串，列位不移动"""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row = [""] * len(header)
+    for i, col in enumerate(header):
+        if col == "timestamp":
+            row[i] = now_str
+        elif col == "总人数":
+            row[i] = str(total_count) if total_count else ""
+        elif col == "总金额":
+            row[i] = str(total_money) if total_money else ""
+        elif col in data:
+            row[i] = _clean_cell(data[col])
+    return row
+
+
+def _render_line(row):
+    """把一行渲染成 CSV 文本（csv.writer 默认 CRLF 行尾），供二进制追加"""
+    buf = io.StringIO()
+    csv.writer(buf).writerow(row)
+    return buf.getvalue()
+
+
+def _write_csv_atomic(rows, money_idx, path=None):
+    """全量写入同目录临时文件后原子替换，避免写到一半损坏原文件"""
+    path = path or CSV_FILE
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            for row in rows:
+                cleaned = [
+                    "" if cell is None else (cell if i == 0 or i == money_idx else _clean_cell(cell))
+                    for i, cell in enumerate(row)
+                ]
+                writer.writerow(cleaned)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            logger.exception("清理临时文件 %s 失败", tmp)
+        raise
+
+
+def _rewrite_csv(data, total_count, total_money):
+    """表头演进或文件格式异常时的一次性全量重写（原子替换）"""
+    rows = []
+    if os.path.exists(CSV_FILE) and os.path.getsize(CSV_FILE) > 0:
+        with open(CSV_FILE, "r", encoding="utf-8-sig", newline="") as f:
+            rows = [r for r in csv.reader(f) if r]
+    if rows:
+        header = rows[0]
+        for col in data:
+            if col not in header:
+                header.append(col)
+    else:
+        header = _expected_header(data)
+        rows = [header]
+    # 新增档位列后，历史行一律补齐到表头宽度，列位不移动
+    for old in rows[1:]:
+        if len(old) < len(header):
+            old.extend([""] * (len(header) - len(old)))
+    rows.append(_format_row(header, data, total_count, total_money))
+    money_idx = header.index("总金额") if "总金额" in header else -1
+    _write_csv_atomic(rows, money_idx)
+    logger.info("已重写 %s（%d 列，%d 行数据）", CSV_FILE, len(header), len(rows) - 1)
+
 
 def append_to_csv(data, total_count, total_money):
-    """带时间戳追加到 CSV 文件（原生 csv 实现，无需 pandas）"""
+    """带时间戳追加到 CSV 文件。
+
+    常规路径只读表头并单行追加，写入成本与历史规模无关；仅在文件缺失、
+    表头缺列或编码/行尾异常时回退到一次性全量重写。
+    """
     if not data:
         logger.warning("未抓取到有效档位数据，请确认页面是否正常。")
         return
 
-    rows = []
-    if os.path.exists(CSV_FILE):
-        with open(CSV_FILE, "r", encoding="utf-8-sig", newline="") as f:
-            rows = [r for r in csv.reader(f) if r]
+    header, state = _check_file_format()
+    if state == "partial":
+        _truncate_partial_line()
+        header, state = _check_file_format()
 
-    if rows:
-        header = rows[0]
-        # 若页面新增档位列，追加到表头并补齐历史行空位
-        for col in data:
-            if col not in header:
-                header.append(col)
-                for old in rows[1:]:
-                    old.append("")
-    else:
-        header = ["timestamp", "总人数", "总金额", *data.keys()]
-        rows = [header]
+    if state != "ok" or header is None or any(col not in header for col in data):
+        _rewrite_csv(data, total_count, total_money)
+        return
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    new_row = [""] * len(header)
-    for i, col in enumerate(header):
-        if col == "timestamp":
-            new_row[i] = now_str
-        elif col == "总人数":
-            new_row[i] = total_count if total_count else ""
-        elif col == "总金额":
-            new_row[i] = total_money if total_money else ""
-        elif col in data:
-            new_row[i] = data[col]
-    rows.append(new_row)
-
-    money_idx = header.index("总金额") if "总金额" in header else None
-    _write_csv(rows, money_idx)
+    line = _render_line(_format_row(header, data, total_count, total_money))
+    with open(CSV_FILE, "ab") as f:
+        f.write(line.encode("utf-8"))
     logger.info("成功记录 %d 个档位数据至 %s", len(data), CSV_FILE)
 
 
