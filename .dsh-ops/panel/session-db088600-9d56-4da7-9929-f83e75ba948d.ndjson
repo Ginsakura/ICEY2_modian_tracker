@@ -1,5 +1,0 @@
-{"record":"open","sessionId":"session-db088600-9d56-4da7-9929-f83e75ba948d","cwd":"I:\\ProgramData\\ProgramProject\\ICEY2_modian_tracker","at":"2026-10-26T12:43:05.783Z"}
-{"record":"event","seq":0,"time":1793018585701,"type":"permission/preset"}
-{"record":"event","seq":1,"time":1793018585701,"type":"sandbox/mode"}
-{"record":"event","seq":2,"time":1793018585726,"type":"approval/policy"}
-{"record":"event","seq":3,"time":1793018585731,"type":"subagent/model-selection-policy"}
