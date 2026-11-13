@@ -7,7 +7,7 @@
 
     BaseChart        数据加载 + 基础趋势渲染 + 十字跟踪 tooltip，供两种用法复用
       ├─ PlotChart       --plot: 渲染后直接显示，输出与重构前逐像素一致
-      └─ AnalyzeChart    --analyze: 九个视图 + matplotlib 原生控件 + 数据实时更新
+      └─ AnalyzeChart    --analyze: 十个视图 + matplotlib 原生控件 + 数据实时更新
 """
 import csv
 import logging
@@ -80,6 +80,11 @@ X_RIGHT_PAD: float = 10 / 1440        # 10 分钟，matplotlib 天数单位
 def _fmt_money(v: float, _=None) -> str:
     """金额类刻度: 千分位整数"""
     return f"{v:,.0f}"
+
+
+def _fmt_wan(v: float) -> str:
+    """金额的紧凑写法: 万元，保留一位小数"""
+    return f"{v / 1e4:,.1f}万"
 
 
 class CursorTracker(Figure):
@@ -282,6 +287,7 @@ class BaseChart:
         self.parsed = []            # [(datetime, row)]，按时序升序
         self.mtime = None
         self._index = {}
+        self.amount_share_skipped = 0   # 最近一次金额占比计算跳过的行数
 
     # ---------------- 数据层 ----------------
 
@@ -373,6 +379,10 @@ class BaseChart:
                 out.append((col, float(m.group(1))))
         return sorted(out, key=lambda x: x[1])
 
+    def tier_price_map(self) -> dict[str, float]:
+        """付费档位列名 -> 表头单价; 列名不含 ￥ 价格的档位不收录"""
+        return {col: price for col, price in self.tier_prices()}
+
     @staticmethod
     def visual_width(s: str) -> int:
         """估算渲染宽度: 全角字符按 2 个半角字符计，用于空格补齐对齐"""
@@ -422,6 +432,71 @@ class BaseChart:
             for k, v in enumerate(vals):
                 series[k].append(v / total * 100)
         return xs, series, totals
+
+    def amount_breakdown(
+        self,
+        row: list[str],
+        labels: list[str],
+        prices: Optional[dict[str, float]] = None,
+        paid_cols: Optional[list[str]] = None,
+    ) -> tuple[list[float], float]:
+        """单行可见档位金额拆分; 数据不完整时返回 ([], 0.0)。
+
+        付费档位金额 = 表头单价 × 份数; 无偿金额 = 总金额 − 全部付费档位金额。
+        以表头所有 Lv 列为准(不硬编码 9 档); 缺单元格按 0 份计; 负残差、
+        缺总金额、付费档位无单价的行视为无效。
+        """
+        total = self.cell(row, "总金额")
+        if math.isnan(total) or total <= 0:
+            return [], 0.0
+        prices = self.tier_price_map() if prices is None else prices
+        paid_cols = self.lv_cols() if paid_cols is None else paid_cols
+        paid: dict[str, float] = {}
+        for col in paid_cols:
+            price = prices.get(col)
+            if price is None:
+                return [], 0.0
+            count = self.cell(row, col)
+            if math.isnan(count) or count < 0:
+                count = 0.0
+            paid[col] = price * count
+        free = total - sum(paid.values())
+        if free < 0:
+            return [], 0.0
+        amounts = [free if lb == "无偿支持" else paid.get(lb, 0.0) for lb in labels]
+        visible_total = sum(amounts)
+        if visible_total <= 0:
+            return [], 0.0
+        return amounts, visible_total
+
+    def amount_share_matrix(
+        self, labels: list[str]
+    ) -> tuple[list[datetime], list[list[float]], list[list[float]], list[float]]:
+        """各档位金额占比序列(分母为该行可见档位金额之和)。
+
+        付费档位金额 = 表头单价 × 份数; 无偿金额 = 总金额 − 全部付费档位金额。
+        返回 (时间列表, [[各标签百分比序列]], [[各标签金额序列]], [可见金额合计])。
+        数据不完整的行跳过，跳过数记录在 self.amount_share_skipped。
+        """
+        xs: list[datetime] = []
+        pct_series: list[list[float]] = [[] for _ in labels]
+        amount_series: list[list[float]] = [[] for _ in labels]
+        totals: list[float] = []
+        prices = self.tier_price_map()
+        paid_cols = self.lv_cols()
+        skipped = 0
+        for ts, row in self.parsed:
+            amounts, total = self.amount_breakdown(row, labels, prices, paid_cols)
+            if not amounts:
+                skipped += 1
+                continue
+            xs.append(ts)
+            totals.append(total)
+            for k, amount in enumerate(amounts):
+                amount_series[k].append(amount)
+                pct_series[k].append(amount / total * 100.0)
+        self.amount_share_skipped = skipped
+        return xs, pct_series, amount_series, totals
 
     def aggregate(self, seconds: int | None = None) -> list[tuple[datetime, float, float]]:
         """按时间桶聚合(取桶内最后一行，累计值语义); seconds 为 None 时用原始采样点"""
@@ -989,7 +1064,7 @@ class PlotChart(BaseChart):
 class AnalyzeChart(BaseChart):
     """--analyze: 交互式分析窗口。
 
-    基础绘图复用 BaseChart.render 产物; 在此基础上提供九个视图与
+    基础绘图复用 BaseChart.render 产物; 在此基础上提供十个视图与
     matplotlib 原生控件(视图切换 / 时间窗口 / 聚合粒度 / 档位显隐 / 重置)，
     并轮询 CSV 变化以保留控件状态实时重绘。
     """
@@ -997,6 +1072,7 @@ class AnalyzeChart(BaseChart):
     VIEW_TREND = "基础趋势"
     VIEW_GROWTH = "增速分析"
     VIEW_SHARE = "档位结构占比"
+    VIEW_SHARE_AMOUNT = "金额结构占比"
     VIEW_ARPU = "客单价指标"
     VIEW_MILESTONE = "里程碑节奏"
     VIEW_FLOW = "净流拆解"
@@ -1004,7 +1080,7 @@ class AnalyzeChart(BaseChart):
     VIEW_RHYTHM = "日内节律"
     VIEW_FINALE = "终局与阶段"
     VIEWS = (
-        VIEW_TREND, VIEW_GROWTH, VIEW_SHARE, VIEW_ARPU, VIEW_MILESTONE,
+        VIEW_TREND, VIEW_GROWTH, VIEW_SHARE, VIEW_SHARE_AMOUNT, VIEW_ARPU, VIEW_MILESTONE,
         VIEW_FLOW, VIEW_MARGIN, VIEW_RHYTHM, VIEW_FINALE,
     )
 
@@ -1012,7 +1088,7 @@ class AnalyzeChart(BaseChart):
     GRAN_SECONDS = (None, 600, 3600)
     GRAN_DEFAULT = 1                 # 默认 10 分钟聚合: 增速/客单价噪声与细节的折中
     GRAN_APPLIES = (VIEW_GROWTH, VIEW_ARPU, VIEW_FLOW, VIEW_MARGIN)
-    TIER_APPLIES = (VIEW_TREND, VIEW_SHARE, VIEW_FLOW, VIEW_MARGIN)
+    TIER_APPLIES = (VIEW_TREND, VIEW_SHARE, VIEW_SHARE_AMOUNT, VIEW_FLOW, VIEW_MARGIN)
 
     FIG_SIZE = (15.0, 9.0)
     PLOT_L, PLOT_R = 0.19, 0.915                # 右边界外扩，压缩与窗口边框的留白；左边界实际取
@@ -1080,7 +1156,7 @@ class AnalyzeChart(BaseChart):
             return ax
 
         # 视图切换
-        self._ax_view = ctrl_ax((0.015, 0.60, 0.145, 0.285))
+        self._ax_view = ctrl_ax((0.015, 0.60, 0.145, 0.32))
         self._ax_view.set_title("视图", fontsize=10, pad=2)
         self.radio_view = RadioButtons(
             self._ax_view, list(self.VIEWS), active=0, label_props={"fontsize": [8]},
@@ -1138,7 +1214,7 @@ class AnalyzeChart(BaseChart):
         gran_on = view in self.GRAN_APPLIES
         tier_on = view in self.TIER_APPLIES
         window_on = view != self.VIEW_MILESTONE
-        snap_on = view == self.VIEW_SHARE
+        snap_on = view in (self.VIEW_SHARE, self.VIEW_SHARE_AMOUNT)
 
         # RadioButtons / CheckButtons 的 set_active() 是"选中第 N 项"，
         # 启停须走 Widget.active 属性(Slider 的 set_active 才是启停)
@@ -1213,9 +1289,9 @@ class AnalyzeChart(BaseChart):
             return
         self.state["snapshot"] = idx
         self._sync_slider_text()
-        if self.state["view"] == self.VIEW_SHARE and self._snapshot_ax is not None:
+        if self.state["view"] in (self.VIEW_SHARE, self.VIEW_SHARE_AMOUNT) and self._snapshot_ax is not None:
             # 快照面板很小，直接清空重绘该面板即可(widget 自身只 blit 自己区域)
-            self._draw_snapshot(self._snapshot_ax)
+            self._draw_snapshot(self._snapshot_ax, self._share_metric())
             self.fig.canvas.draw_idle()
 
     def _on_reset(self, event):
@@ -1390,7 +1466,8 @@ class AnalyzeChart(BaseChart):
         drawers = {
             self.VIEW_TREND: self._draw_trend_view,
             self.VIEW_GROWTH: self._draw_growth_view,
-            self.VIEW_SHARE: self._draw_share_view,
+            self.VIEW_SHARE: lambda: self._draw_share_view("count"),
+            self.VIEW_SHARE_AMOUNT: lambda: self._draw_share_view("money"),
             self.VIEW_ARPU: self._draw_arpu_view,
             self.VIEW_MILESTONE: self._draw_milestone_view,
             self.VIEW_FLOW: self._draw_flow_view,
@@ -1466,16 +1543,28 @@ class AnalyzeChart(BaseChart):
             x_arr=x, anchor_y=np.asarray(rp, dtype=float), provider=provider,
         )
 
-    # ---- 视图三: 档位结构占比(100% 堆积 + 环形快照)----
+    # ---- 视图三/四: 档位占比(份数 / 金额) + 环形快照 ----
 
-    def _draw_share_view(self) -> None:
+    def _share_metric(self) -> str:
+        """当前占比视图的统计口径: count=份数, money=金额"""
+        return "money" if self.state["view"] == self.VIEW_SHARE_AMOUNT else "count"
+
+    def _draw_share_view(self, metric: str = "count") -> None:
         labels = [c for c in self.stack_labels() if self.state["visible"].get(c, True)]
         if not labels:
             self._notice("已隐藏全部档位，请在左侧至少保留一个档位。")
             return
-        xs, series, _totals = self.share_matrix(labels)
+        if metric == "money":
+            xs, series, amount_series, _totals = self.amount_share_matrix(labels)
+            empty_text = "金额数据不可用，无法计算占比。"
+            title = "档位金额占比迁移(占可见档位金额之和)"
+        else:
+            xs, series, _totals = self.share_matrix(labels)
+            amount_series = []
+            empty_text = "档位数据不可用，无法计算占比。"
+            title = "档位结构占比迁移(占档位人数总和)"
         if not xs:
-            self._notice("档位数据不可用，无法计算占比。")
+            self._notice(empty_text)
             return
         x = mdates.date2num(xs)
         stack_w = max(0.30, self.DONUT_RECT[0] - 0.02 - self.plot_l())
@@ -1487,19 +1576,23 @@ class AnalyzeChart(BaseChart):
         ax.set_ylim(0, 100)
         ax.set_ylabel("占比(%)", fontsize=11)
         ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.0f}"))
-        ax.set_title("档位结构占比迁移(占档位人数总和)", fontsize=12, fontweight="bold")
+        ax.set_title(title, fontsize=12, fontweight="bold")
         ax.grid(True, linestyle="--", alpha=0.4)
         self._apply_time_axis(ax, self.window_xlim())
         self.attach_time_status(ax, " %")
+        if metric == "money" and self.amount_share_skipped:
+            ax.text(0.01, 0.02, f"{self.amount_share_skipped} 行数据不完整(未显示)",
+                    transform=ax.transAxes, fontsize=8, color="#777777", va="bottom")
         # 档位配色与右侧快照图例一致，故此处不再重复图例
 
         self._snapshot_ax = self.fig.add_axes((self.DONUT_RECT))
-        self._draw_snapshot(self._snapshot_ax)
+        self._draw_snapshot(self._snapshot_ax, metric)
 
         def provider(i):
             lines = [f"{xs[i]:%Y-%m-%d %H:%M}"]
             for k, lb in enumerate(labels):
-                lines.append(f"{lb}: {series[k][i]:.2f}%")
+                suffix = f" ({_fmt_wan(amount_series[k][i])})" if metric == "money" else ""
+                lines.append(f"{lb}: {series[k][i]:.2f}%{suffix}")
             return lines
 
         self.cursor.bind(
@@ -1507,21 +1600,29 @@ class AnalyzeChart(BaseChart):
             x_arr=x, anchor_y=np.zeros(len(x)), provider=provider,
         )
 
-    def _draw_snapshot(self, ax: Axes) -> None:
+    def _draw_snapshot(self, ax: Axes, metric: str = "count") -> None:
         """环形图快照: 档位顺序固定为 Lv1~Lv9、无偿支持(与堆积顺序一致)，极小档位由图例数字兜底"""
         ax.clear()
-        labels = self.stack_labels()
-        if not self.parsed:
+        labels = [c for c in self.stack_labels() if self.state["visible"].get(c, True)]
+        if not self.parsed or not labels:
             return
         idx = min(max(self.state["snapshot"], 0), len(self.parsed) - 1)
         ts, row = self.parsed[idx]
-        pairs = []
-        for c in labels:
-            if not self.state["visible"].get(c, True):
-                continue
-            v = self.cell(row, c)
-            pairs.append((c, 0.0 if math.isnan(v) or v < 0 else v))
-        total = sum(v for _, v in pairs)
+        if metric == "money":
+            amounts, total = self.amount_breakdown(row, labels)
+            pairs = list(zip(labels, amounts))
+            no_data_text = "无金额数据"
+            title = f"金额占比快照 {ts:%m-%d %H:%M}"
+            center = f"{ts:%m-%d %H:%M}\n合计 {total / 1e4:,.1f} 万元"
+        else:
+            pairs = []
+            for c in labels:
+                v = self.cell(row, c)
+                pairs.append((c, 0.0 if math.isnan(v) or v < 0 else v))
+            total = sum(v for _, v in pairs)
+            no_data_text = "无档位数据"
+            title = f"占比快照 {ts:%m-%d %H:%M}"
+            center = f"{ts:%m-%d %H:%M}\n合计 {total:,.0f} 人"
         ax.set_xlim(-1.15, 1.15)
         ax.set_ylim(-1.15, 1.15)
         ax.set_aspect("equal")
@@ -1529,9 +1630,9 @@ class AnalyzeChart(BaseChart):
         ax.set_yticks([])
         for spine in ax.spines.values():
             spine.set_visible(False)
-        ax.set_title(f"占比快照 {ts:%m-%d %H:%M}", fontsize=11)
+        ax.set_title(title, fontsize=11)
         if total <= 0:
-            ax.text(0, 0, "无档位数据", ha="center", va="center", fontsize=10, color="#666666")
+            ax.text(0, 0, no_data_text, ha="center", va="center", fontsize=10, color="#666666")
             return
 
         radius, width = 1.00, 0.24           # 外半径与环宽(环细一些，图例移到图下方)
@@ -1551,11 +1652,13 @@ class AnalyzeChart(BaseChart):
                         ha="center", va="center", fontsize=8, color="white",
                         fontweight="bold", zorder=4)
             theta -= span
-        ax.text(0, 0, f"{ts:%m-%d %H:%M}\n合计 {total:,.0f} 人",
-                ha="center", va="center", fontsize=9, zorder=4)
+        ax.text(0, 0, center, ha="center", va="center", fontsize=9, zorder=4)
 
         handles = [Patch(facecolor=self.tier_color(n), edgecolor="white") for n, _ in pairs]
-        texts = [f"{n}  {v / total * 100:.2f}%  ({v:,.0f})" for n, v in pairs]
+        if metric == "money":
+            texts = [f"{n}  {v / total * 100:.2f}%  ({_fmt_wan(v)})" for n, v in pairs]
+        else:
+            texts = [f"{n}  {v / total * 100:.2f}%  ({v:,.0f})" for n, v in pairs]
         ax.legend(handles, texts, loc="upper center", bbox_to_anchor=(0.5, 0.0),
                   ncol=2, fontsize=7, handlelength=1.1, handleheight=0.9,
                   columnspacing=1.0, labelspacing=0.3, frameon=False)

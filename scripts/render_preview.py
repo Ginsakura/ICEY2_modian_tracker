@@ -19,7 +19,7 @@ import charts  # noqa: E402
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="渲染九个分析视图为 PNG")
+    ap = argparse.ArgumentParser(description="渲染十个分析视图为 PNG")
     ap.add_argument("--csv", default="data.csv")
     ap.add_argument("--out", default=".preview")
     ap.add_argument("--window", default="", help="时间窗口索引 lo,hi；缺省为全窗口")
