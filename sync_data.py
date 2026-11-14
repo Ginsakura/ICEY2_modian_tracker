@@ -6,7 +6,7 @@
     python sync_data.py               # 以守护进程方式运行
     python sync_data.py --dry-run     # 仅打印未来调度计划，不执行任何 git 命令
     python sync_data.py --tick 30     # 设置轮询间隔秒数（默认 30）
-    也可作为线程嵌入 tracker：modian_tracker.py 的 run_forever 会以 daemon
+    也可作为线程嵌入 tracker：modian_tracker.py 的 run_collector 会以 daemon
     线程方式调用 sync_loop()，随抓取进程一同启停，无需单独驱动。
 """
 import argparse

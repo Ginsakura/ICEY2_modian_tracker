@@ -15,7 +15,9 @@ import math
 import os
 import re
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from types import FunctionType, MethodType
 
 import matplotlib.dates as mdates
@@ -39,15 +41,77 @@ if TYPE_CHECKING:
     from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 import shared_logger
+import tier_columns
+import tracker_config
 logger = shared_logger.get_logger("charts")
 
-CSV_FILE: str = "data.csv"
 
-# 总金额里程碑 L 形标注: 数据范围内每个整百万倍(27M、28M…，虚线)/整千万倍(30M、40M…，实线)，
-# 判定"刚超过": 上一点 < 阈值 ≤ 当前点(相邻点比较); 千万倍数优先，同一点不重复标记。
-# 固定颜色与红色总金额折线及堆积区域色(蓝/橙/绿/红/紫/棕/粉/灰/黄绿/青)均保持可区分
-MILLION_STEP: int = 1_000_000        # 百万级里程碑间距(虚线)
-TENMILLION_STEP: int = 10_000_000    # 千万级里程碑间距(实线)
+@dataclass(frozen=True)
+class ChartContext:
+    """单个项目的图表元数据；数据文件与 campaign 配置解耦。"""
+    csv_file: str
+    deadline: datetime | None
+    plot_left: datetime | None
+    phases: tuple[tracker_config.Phase, ...]
+    milestone_step: int          # 0 表示按数据自适应
+    project_key: str
+
+
+NICE_STEPS: tuple[float, ...] = (1.0, 2.0, 2.5, 5.0)
+
+
+def _nice_step(value: float) -> int:
+    """返回最接近 value 的 nice 步长（1/2/2.5/5 × 10^n，最小 1 元）。"""
+    if value <= 1:
+        return 1
+    exponent = math.floor(math.log10(value))
+    candidates: set[int] = set()
+    for n in range(max(0, exponent - 1), exponent + 2):
+        for mult in NICE_STEPS:
+            candidate = mult * (10 ** n)
+            if candidate >= 1:
+                candidates.add(max(1, int(round(candidate))))
+    return min(candidates, key=lambda c: (abs(c - value), c))
+
+
+def choose_milestone_step(max_money: float) -> int:
+    """按总金额的 1/40 选取里程碑步长；icey2 约 1M、linglan 约 100 元。"""
+    if not math.isfinite(max_money) or max_money <= 0:
+        return 1
+    return _nice_step(max_money / 40.0)
+
+
+def choose_money_unit(max_money: float) -> tuple[float, str]:
+    """按金额量级返回 (换算系数, 单位)：元 / 万元 / 百万元。"""
+    if max_money >= 1e6:
+        return 1e6, "百万元"
+    if max_money >= 1e4:
+        return 1e4, "万元"
+    return 1.0, "元"
+
+
+def resolve_chart_context(csv_file: str | None = None,
+                          project: str | None = None,
+                          config_path: str | Path | None = None) -> ChartContext:
+    """按 csv_file 匹配项目，其次显式项目名，最后 defaults.project。"""
+    config = tracker_config.load_config(config_path)
+    selected = None
+    if csv_file is not None:
+        target = Path(csv_file).resolve()
+        selected = next((p for p in config.projects.values() if p.data_path == target), None)
+    if selected is None and project is not None:
+        selected = config.project(project)
+    if selected is None:
+        selected = config.project(None)
+    campaign = selected.campaign
+    return ChartContext(
+        csv_file=str(csv_file) if csv_file is not None else str(selected.data_path),
+        deadline=campaign.deadline,
+        plot_left=campaign.start,
+        phases=campaign.phases,
+        milestone_step=campaign.milestone_step or 0,
+        project_key=selected.name,
+    )
 
 
 class MilestoneStyle(TypedDict):
@@ -57,34 +121,17 @@ class MilestoneStyle(TypedDict):
 
 
 MILESTONE_STYLE: dict[str, MilestoneStyle] = {
-    "million": {"linestyle": "--", "color": "#4B0082"},      # 深靛紫虚线
-    "tenmillion": {"linestyle": "-", "color": "#000000"},    # 黑色实线
+    "minor": {"linestyle": "--", "color": "#4B0082"},      # 次级里程碑：深靛紫虚线
+    "major": {"linestyle": "-", "color": "#000000"},       # 主里程碑：黑色实线
 }
 
-# 众筹阶段切分(按日增金额的阶段特征人工划分): (名称, 起始日, 结束日(不含))
-# 数据起点 10-05 22:00 属预热段，阶段判定自 10-06 起；截止时刻见 DEADLINE
-CAMPAIGN_PHASES: tuple[tuple[str, date, date], ...] = (
-    ("P1 起势", date(2026, 10, 5), date(2026, 10, 8)),
-    ("P2 退坡", date(2026, 10, 8), date(2026, 10, 15)),
-    ("P3 二次脉冲", date(2026, 10, 15), date(2026, 10, 18)),
-    ("P4 断崖", date(2026, 10, 18), date(2026, 10, 23)),
-    ("P5 长尾", date(2026, 10, 23), date(2026, 11, 16)),
-)
-DEADLINE: datetime = datetime(2026, 11, 15, 23, 59)
-
-# --plot 时间轴左边界(十周年《艾希》续作众筹起始时刻)，右边界为末点 + 10 分钟
-PLOT_X_LEFT: datetime = datetime(2026, 10, 5, 22, 0)
+# --plot 时间轴右边界留白；左边界取自项目 campaign.start，缺省用数据首行
 X_RIGHT_PAD: float = 10 / 1440        # 10 分钟，matplotlib 天数单位
 
 
 def _fmt_money(v: float, _=None) -> str:
     """金额类刻度: 千分位整数"""
     return f"{v:,.0f}"
-
-
-def _fmt_wan(v: float) -> str:
-    """金额的紧凑写法: 万元，保留一位小数"""
-    return f"{v / 1e4:,.1f}万"
 
 
 class CursorTracker(Figure):
@@ -280,14 +327,40 @@ class BaseChart:
     attach_dual_status/row_tooltip)，并共享 CursorTracker 的交互行为。
     """
 
-    def __init__(self, csv_file=CSV_FILE, logger=None):
-        self.csv_file = csv_file
+    def __init__(self, csv_file=None, project=None, logger=None, config_path=None):
+        self.context = resolve_chart_context(csv_file, project, config_path)
+        self.csv_file = self.context.csv_file
         self.logger = logger
         self.header = []
         self.parsed = []            # [(datetime, row)]，按时序升序
         self.mtime = None
         self._index = {}
         self.amount_share_skipped = 0   # 最近一次金额占比计算跳过的行数
+        self.milestone_step = 1
+        self.money_scale = 1.0
+        self.money_unit = "元"
+        self.max_money = 0.0
+
+    @property
+    def major_step(self) -> int:
+        """主里程碑步长（次级里程碑的 10 倍）。"""
+        return self.milestone_step * 10
+
+    def short_amount(self, value: float) -> str:
+        """按当前金额单位格式化一个金额，用于 tooltip / 图例。"""
+        if self.money_unit == "百万元":
+            return f"{value / 1e6:,.2f}百万元"
+        if self.money_unit == "万元":
+            return f"{value / 1e4:,.2f}万元"
+        return f"{value:,.0f}元"
+
+    def step_amount(self, value: float) -> str:
+        """里程碑标签：1M / 100元 / 1.5万。"""
+        if value >= 1e6:
+            return f"{value / 1e6:g}M"
+        if value >= 1e4:
+            return f"{value / 1e4:g}万"
+        return f"{value:,.0f}元"
 
     # ---------------- 数据层 ----------------
 
@@ -318,6 +391,10 @@ class BaseChart:
             self.mtime = os.path.getmtime(self.csv_file)
         except OSError:
             self.mtime = None
+        valid_money = [v for v in self.col_values("总金额") if not math.isnan(v)]
+        self.max_money = max(valid_money) if valid_money else 0.0
+        self.milestone_step = self.context.milestone_step or choose_milestone_step(self.max_money)
+        self.money_scale, self.money_unit = choose_money_unit(self.max_money)
         return True
 
     def cell(self, row, name: str) -> float:
@@ -349,14 +426,18 @@ class BaseChart:
 
     @staticmethod
     def _lv_no(col: str) -> int:
-        m = re.search(r"Lv(\d+)", col)
-        return int(m.group(1)) if m else -1
+        value = tier_columns.parse_lv_no(col)
+        return value if value is not None else -1
 
     def lv_cols(self) -> list[str]:
-        return sorted([c for c in self.header if c.startswith("Lv")], key=self._lv_no)
+        """档位列按 (价格, Lv 序号, 列名) 排序；缺价格的列排在付费列之后。"""
+        def key(col: str):
+            price = tier_columns.parse_price(col)
+            return (price is None, float(price or 0), self._lv_no(col), col)
+        return sorted([c for c in self.header if c.startswith("Lv")], key=key)
 
     def stack_labels(self) -> list[str]:
-        """堆积顺序: 自下而上 Lv1~Lv9、无偿支持"""
+        """堆积顺序: 自下而上按价格排序的 Lv 列、无偿支持"""
         return self.lv_cols() + (["无偿支持"] if "无偿支持" in self.header else [])
 
     @staticmethod
@@ -371,13 +452,13 @@ class BaseChart:
         return self.cycle_color(labels.index(label) if label in labels else 0)
 
     def tier_prices(self) -> list[tuple[str, float]]:
-        """付费档位(列名, 价格)按价格升序"""
+        """付费档位(列名, 价格)按价格、Lv 序号升序；只认列名末端全角价格。"""
         out = []
         for col in self.lv_cols():
-            m = re.search(r"[¥￥]\s*([\d.]+)", col)
-            if m:
-                out.append((col, float(m.group(1))))
-        return sorted(out, key=lambda x: x[1])
+            price = tier_columns.parse_price(col)
+            if price is not None:
+                out.append((col, float(price)))
+        return sorted(out, key=lambda x: (x[1], self._lv_no(x[0])))
 
     def tier_price_map(self) -> dict[str, float]:
         """付费档位列名 -> 表头单价; 列名不含 ￥ 价格的档位不收录"""
@@ -556,8 +637,10 @@ class BaseChart:
         marks = []
         prev_ts = self.parsed[valid[0]][0]
         partial = True
-        for k in range(1, int(max_v // MILLION_STEP) + 1):
-            threshold = k * MILLION_STEP
+        step = max(1, self.milestone_step)
+        major = max(1, self.major_step)
+        for k in range(1, int(max_v // step) + 1):
+            threshold = k * step
             idx = next(
                 (i for i in range(1, len(money))
                  if not math.isnan(money[i]) and not math.isnan(money[i - 1])
@@ -571,7 +654,7 @@ class BaseChart:
                 "value": float(threshold),
                 "ts": ts,
                 "hours": (ts - prev_ts).total_seconds() / 3600,
-                "tenmillion": threshold % TENMILLION_STEP == 0,
+                "major": threshold % major == 0,
                 "partial": partial,
             })
             prev_ts = ts
@@ -776,10 +859,14 @@ class BaseChart:
         }
 
     def finale_forecast(self, fit_days: int = FINALE_FIT_DAYS,
-                        deadline: datetime = DEADLINE) -> dict[str, Any]:
-        """用最近若干完整自然日的日增做线性/对数线性拟合，外推到截止时刻"""
+                        deadline: datetime | None = None) -> dict[str, Any]:
+        """用最近若干完整自然日的日增做线性/对数线性拟合，外推到截止时刻。"""
         if len(self.parsed) < 2:
             return {"forecast": False, "reason": "数据点不足"}
+        if deadline is None:
+            deadline = self.context.deadline
+        if deadline is None:
+            return {"forecast": False, "reason": "未配置截止时间"}
         end_ts = self.parsed[-1][0]
         money = self.col_values("总金额")
         valid = [v for v in money if not math.isnan(v)]
@@ -816,7 +903,8 @@ class BaseChart:
         hi_total = float(max(lin_cum[-1], exp_cum[-1]))
 
         milestone = None
-        target = (math.floor(current / MILLION_STEP) + 1) * MILLION_STEP
+        step = max(1, self.milestone_step)
+        target = (math.floor(current / step) + 1) * step
         if target <= hi_total:
             remain = target - current
             r_fast = max(float(lin_pred[0]), float(exp_pred[0]))
@@ -893,20 +981,21 @@ class BaseChart:
                 color="black", linewidth=2, label=legend_name("总人数"),
             )
 
-        # 右轴: 总金额折线(单位百万元)
+        # 右轴: 总金额折线(单位随金额量级自适应)
         line_money = None
         money_vals_m = None
         money_yuan = None
         ax2 = ax1.twinx()
         if "总金额" in self.header:
             money_yuan = self.col_values("总金额")          # 原始金额(元)
-            money_vals_m = [v / 1e6 for v in money_yuan]
+            money_vals_m = [v / self.money_scale for v in money_yuan]
             line_money, = ax2.plot(
                 x_dates, money_vals_m,
                 color="red", linewidth=2, label=legend_name("总金额"),
             )
-            ax2.set_ylabel("总金额(百万元)", fontsize=11, color="red")
-            ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}"))
+            ax2.set_ylabel(f"总金额({self.money_unit})", fontsize=11, color="red")
+            money_fmt = _fmt_money if self.money_scale == 1.0 else (lambda v, _: f"{v:.2f}")
+            ax2.yaxis.set_major_formatter(mticker.FuncFormatter(money_fmt))
             ax2.tick_params(axis="y", labelcolor="red")
 
             # 总金额里程碑 L 形标注(整百万倍虚线 / 整千万倍实线，连到 X/Y 轴)
@@ -935,14 +1024,14 @@ class BaseChart:
                             marks.append((idx, threshold))
                     return marks
 
-                # 千万级优先占点，百万级跳过同一点，避免同一位置一虚一实两条线重叠
-                ten_marks = milestone_points(TENMILLION_STEP)
+                # 主里程碑优先占点，次级里程碑跳过同一点，避免同一位置一虚一实两条线重叠
+                ten_marks = milestone_points(self.major_step)
                 ten_idx = {i for i, _ in ten_marks}
-                mil_marks = [(i, t) for i, t in milestone_points(MILLION_STEP) if i not in ten_idx]
+                mil_marks = [(i, t) for i, t in milestone_points(self.milestone_step) if i not in ten_idx]
 
                 y_bottom, _ = ax2.get_ylim()
                 x_right = x_dates[-1] + X_RIGHT_PAD   # 与 xlim 右边界一致(横线连到右侧 Y 轴)
-                for kind, marks in (("million", mil_marks), ("tenmillion", ten_marks)):
+                for kind, marks in (("minor", mil_marks), ("major", ten_marks)):
                     style = MILESTONE_STYLE[kind]
                     for idx, _threshold in marks:
                         x_i = x_dates[idx]
@@ -954,8 +1043,14 @@ class BaseChart:
 
         ax1.yaxis.set_major_locator(mticker.MultipleLocator(2))     # 主刻度间距: 1 万人
         ax1.yaxis.set_minor_locator(mticker.MultipleLocator(0.5))   # 次刻度间距: 0.5 万人
-        ax2.yaxis.set_major_locator(mticker.MultipleLocator(0.5))   # 主刻度间距: 1 百万元
-        ax2.yaxis.set_minor_locator(mticker.MultipleLocator(0.1))   # 次刻度间距: 0.1 百万元
+        if self.money_scale == 1e6:
+            # 百万元模式保留原有 0.5 / 0.1 刻度，确保与原图逐像素一致
+            ax2.yaxis.set_major_locator(mticker.MultipleLocator(0.5))
+            ax2.yaxis.set_minor_locator(mticker.MultipleLocator(0.1))
+        else:
+            # 万元/元模式按实际数据范围生成刻度，避免小额项目出现 0.5 元级主刻度
+            ax2.yaxis.set_major_locator(mticker.MaxNLocator(nbins=6))
+            ax2.yaxis.set_minor_locator(mticker.AutoMinorLocator(5))
 
         ax1.set_xlabel("时间", fontsize=11)
         ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
@@ -965,15 +1060,16 @@ class BaseChart:
 
         # 时间轴范围: --plot 默认左边界固定紧贴左侧、右侧留 10 分钟空白; 分析视图传入窗口范围
         if xlim is None:
+            left = self.context.plot_left or self.parsed[0][0]
             xlim = (
-                float(mdates.date2num(PLOT_X_LEFT)),
+                float(mdates.date2num(left)),
                 float(x_dates[-1].item()) + X_RIGHT_PAD,
             )
         ax1.set_xlim(*xlim)
 
         if title is None:
             last_time = mdates.num2date(x_dates[-1])
-            title = f"摩点众筹各档位支持人数堆积趋势(截至{last_time:%Y年%m月%d日 %H:%M})"
+            title = f"{self.context.project_key} 摩点众筹各档位支持人数堆积趋势(截至{last_time:%Y年%m月%d日 %H:%M})"
         ax1.set_title(title, fontsize=14, fontweight="bold")
         ax1.grid(True, linestyle="--", alpha=0.4)
 
@@ -1014,8 +1110,8 @@ class BaseChart:
                 _, money = ax2.transData.inverted().transform((x_fig, y_fig))
                 # 复用与坐标轴刻度相同的格式化方式，保证时间显示一致
                 time_str = time_fmt.format_ticks([x1])[0]
-                # 轴数据为万人/百万元，这里还原为原始人数与金额显示
-                return f"({time_str}, {people * 1e4:.0f}, {money * 1e6:.2f})"
+                # 轴数据为万人/自适应金额单位，这里还原为原始人数与金额显示
+                return f"({time_str}, {people * 1e4:.0f}, {money * self.money_scale:.2f})"
             except Exception:
                 return ""
 
@@ -1043,7 +1139,7 @@ class PlotChart(BaseChart):
         self.setup_fonts()
         if not self.load():
             return
-        fig = plt.figure("十周年《艾希》续作《艾希: 续》Steam版众筹数据", figsize=(12, 6))
+        fig = plt.figure(f"摩点众筹数据 - {self.context.project_key}", figsize=(12, 6))
         fig.subplots_adjust(**{"left": 0.06, "bottom": 0.08, "right": 0.94, "top": 0.955})
         ax1 = fig.subplots()
         res = self.draw_trend(ax1)
@@ -1109,11 +1205,13 @@ class AnalyzeChart(BaseChart):
     MARGINAL_YLIM = (0, 650)                    # 边际客单价显示范围(覆盖全部档位价格线)
     PRICE_CLUSTER_GAP = 12                      # 价格参考线标注合并阈值(元)
 
-    def __init__(self, csv_file: str = CSV_FILE, logger: Optional[logging.Logger] = None, refresh_interval: int = 60):
-        super().__init__(csv_file=csv_file, logger=logger)
+    def __init__(self, csv_file: str | None = None, project: str | None = None,
+                 logger: Optional[logging.Logger] = None, refresh_interval: int = 60,
+                 config_path: str | Path | None = None):
+        super().__init__(csv_file=csv_file, project=project, logger=logger, config_path=config_path)
         self.setup_fonts()
         if not self.load():
-            raise RuntimeError(f"无法加载数据文件: {csv_file}")
+            raise RuntimeError(f"无法加载数据文件: {self.csv_file}")
         n = max(0, len(self.parsed) - 1)
         self.state = {
             "view": self.VIEW_TREND,
@@ -1128,7 +1226,7 @@ class AnalyzeChart(BaseChart):
         self._pending_render = False
         self._last_render = 0.0
 
-        self.fig = plt.figure("摩点众筹数据分析", figsize=self.FIG_SIZE)
+        self.fig = plt.figure(f"摩点众筹数据分析 - {self.context.project_key}", figsize=self.FIG_SIZE)
         self.cursor = CursorTracker(self.fig)
         self._build_controls()
         self._refresh_interval = max(5, int(refresh_interval))
@@ -1591,7 +1689,7 @@ class AnalyzeChart(BaseChart):
         def provider(i):
             lines = [f"{xs[i]:%Y-%m-%d %H:%M}"]
             for k, lb in enumerate(labels):
-                suffix = f" ({_fmt_wan(amount_series[k][i])})" if metric == "money" else ""
+                suffix = f" ({self.short_amount(amount_series[k][i])})" if metric == "money" else ""
                 lines.append(f"{lb}: {series[k][i]:.2f}%{suffix}")
             return lines
 
@@ -1601,7 +1699,7 @@ class AnalyzeChart(BaseChart):
         )
 
     def _draw_snapshot(self, ax: Axes, metric: str = "count") -> None:
-        """环形图快照: 档位顺序固定为 Lv1~Lv9、无偿支持(与堆积顺序一致)，极小档位由图例数字兜底"""
+        """环形图快照: 档位顺序与堆积顺序一致(按价格排序的 Lv 列、无偿支持)，极小档位由图例数字兜底"""
         ax.clear()
         labels = [c for c in self.stack_labels() if self.state["visible"].get(c, True)]
         if not self.parsed or not labels:
@@ -1613,7 +1711,7 @@ class AnalyzeChart(BaseChart):
             pairs = list(zip(labels, amounts))
             no_data_text = "无金额数据"
             title = f"金额占比快照 {ts:%m-%d %H:%M}"
-            center = f"{ts:%m-%d %H:%M}\n合计 {total / 1e4:,.1f} 万元"
+            center = f"{ts:%m-%d %H:%M}\n合计 {self.short_amount(total)}"
         else:
             pairs = []
             for c in labels:
@@ -1656,7 +1754,7 @@ class AnalyzeChart(BaseChart):
 
         handles = [Patch(facecolor=self.tier_color(n), edgecolor="white") for n, _ in pairs]
         if metric == "money":
-            texts = [f"{n}  {v / total * 100:.2f}%  ({_fmt_wan(v)})" for n, v in pairs]
+            texts = [f"{n}  {v / total * 100:.2f}%  ({self.short_amount(v)})" for n, v in pairs]
         else:
             texts = [f"{n}  {v / total * 100:.2f}%  ({v:,.0f})" for n, v in pairs]
         ax.legend(handles, texts, loc="upper center", bbox_to_anchor=(0.5, 0.0),
@@ -1756,10 +1854,10 @@ class AnalyzeChart(BaseChart):
 
         bar_w = 8 / 24                          # 固定 8 小时宽度的柱(时间点标记，非耗时跨度)
         for m, x in zip(marks, xs):
-            color = "#4B0082" if m["tenmillion"] else "#1f77b4"
+            color = "#4B0082" if m["major"] else "#1f77b4"
             ax.bar(x, m["hours"], width=bar_w, color=color, edgecolor="#333333",
                    linewidth=0.8, zorder=3)
-            label = f"{m['value'] / MILLION_STEP:.0f}M\n{m['hours']:.1f}h"
+            label = f"{self.step_amount(m['value'])}\n{m['hours']:.1f}h"
             if m["partial"]:
                 label += "*"
             ax.annotate(label, (x, m["hours"]), textcoords="offset points", xytext=(0, 3),
@@ -1768,17 +1866,18 @@ class AnalyzeChart(BaseChart):
         hours = [m["hours"] for m in marks]
         ax.set_ylim(0, max(hours) * 1.28)
         ax.set_ylabel("耗时(小时)", fontsize=11)
-        ax.set_title("里程碑节奏: 每提升 100 万元所需的耗时(紫柱为千万元级)",
+        ax.set_title(f"里程碑节奏: 每提升 {self.step_amount(self.milestone_step)} 所需的耗时"
+                     f"(紫柱为 {self.step_amount(self.major_step)} 级)",
                      fontsize=13, fontweight="bold")
         ax.grid(True, axis="y", linestyle="--", alpha=0.4)
         ax.text(0.01, 0.97, "* 首个里程碑自数据起点起算，区间不完整，耗时偏小",
                 transform=ax.transAxes, fontsize=8, color="#777777", va="top", zorder=6)
 
         # 累计金额曲线(右轴): 作为"当时筹款斜率"的上下文
-        money_m = [v / MILLION_STEP if not math.isnan(v) else float("nan")
+        money_m = [v / self.money_scale if not math.isnan(v) else float("nan")
                    for v in self.col_values("总金额")]
         axr.plot(self.x_dates(), money_m, color="red", linewidth=1.6, alpha=0.55, zorder=2)
-        axr.set_ylabel("累计金额(百万元)", fontsize=11, color="red")
+        axr.set_ylabel(f"累计金额({self.money_unit})", fontsize=11, color="red")
         axr.tick_params(axis="y", labelcolor="red")
 
         x_lo = float(min(xs)) - 12 / 24
@@ -1791,15 +1890,15 @@ class AnalyzeChart(BaseChart):
             axr.set_ylim(lo - 0.08 * span, hi + 0.08 * span)
         self._apply_time_axis(ax)
         self.attach_time_status(ax, " 小时")
-        self.attach_time_status(axr, " 百万元")
+        self.attach_time_status(axr, f" {self.money_unit}")
 
-        anchor_y = [m["value"] / MILLION_STEP for m in marks]
+        anchor_y = [m["value"] / self.money_scale for m in marks]
 
         def provider(i):
             m = marks[i]
             note = "(自数据起点起算，区间不完整)" if m["partial"] else ""
             return [
-                f"{m['value'] / MILLION_STEP:.0f} 百万元里程碑",
+                f"{self.short_amount(m['value'])} 里程碑",
                 f"跨越时刻: {m['ts']:%Y-%m-%d %H:%M}",
                 f"耗时: {m['hours']:.2f} 小时{note}",
             ]
@@ -1816,7 +1915,7 @@ class AnalyzeChart(BaseChart):
         """把 "Lv2（￥45.6）" 压缩成 "Lv2 ￥45.6"，给横条图左侧刻度留出空间"""
         if label == "无偿支持":
             return label
-        m = re.match(r"(Lv\d+)（￥([\d.]+)）", label)
+        m = re.match(r"(Lv\.?\s*\d+).*（￥([\d.]+)）$", label)
         return f"{m.group(1)} ￥{m.group(2)}" if m else label
 
     # ---- 视图六: 净流拆解(毛增 / 回吐 / 净增)----
@@ -2076,7 +2175,8 @@ class AnalyzeChart(BaseChart):
         if len(money) >= 3:
             ma = np.convolve(money, np.ones(3) / 3, mode="valid")
             ax.plot(x[2:], ma, color="#d62728", linewidth=1.6, label="3 日均线")
-        for name, start, end in CAMPAIGN_PHASES:
+        for phase in self.context.phases:
+            start, end = phase.start, phase.end
             x0 = mdates.date2num(datetime.combine(start, datetime.min.time()))
             x1 = mdates.date2num(datetime.combine(end, datetime.min.time()))
             ax.axvspan(x0, x1, color="#999999", alpha=0.07, zorder=0)
@@ -2086,7 +2186,13 @@ class AnalyzeChart(BaseChart):
             cx = sum(mdates.date2num(datetime.combine(d["date"], datetime.min.time()))
                      for d in in_phase) / len(in_phase)
             avg = sum(d["money"] for d in in_phase) / len(in_phase)
-            ax.annotate(f"{name} {avg / 1e4:,.0f}万/日", (cx, 1.0),
+            if avg >= 1e6:
+                avg_label = f"{avg / 1e6:g}百万元/日"
+            elif avg >= 1e4:
+                avg_label = f"{avg / 1e4:,.0f}万/日"
+            else:
+                avg_label = f"{avg:,.0f}元/日"
+            ax.annotate(f"{phase.name} {avg_label}", (cx, 1.0),
                         xycoords=ax.get_xaxis_transform(), xytext=(0, 2),
                         textcoords="offset points", ha="center", va="bottom",
                         fontsize=7, color="#444444")
@@ -2106,30 +2212,34 @@ class AnalyzeChart(BaseChart):
             sharex=ax,
         )
         cx = mdates.date2num(cum_ts)
-        axc.plot(cx, cum_money, color="red", linewidth=1.8, label="累计金额", zorder=3)
-        for _, start, end in CAMPAIGN_PHASES:
-            axc.axvspan(mdates.date2num(datetime.combine(start, datetime.min.time())),
-                        mdates.date2num(datetime.combine(end, datetime.min.time())),
+        scale, unit = self.money_scale, self.money_unit
+        axc.plot(cx, [v / scale for v in cum_money], color="red", linewidth=1.8,
+                 label="累计金额", zorder=3)
+        for phase in self.context.phases:
+            axc.axvspan(mdates.date2num(datetime.combine(phase.start, datetime.min.time())),
+                        mdates.date2num(datetime.combine(phase.end, datetime.min.time())),
                         color="#999999", alpha=0.05, zorder=0)
         if fc["forecast"]:
             fx = mdates.date2num(fc["future_dates"])
-            lin_cum = np.asarray(fc["lin_cum"], dtype=float)
-            exp_cum = np.asarray(fc["exp_cum"], dtype=float)
+            lin_cum = np.asarray(fc["lin_cum"], dtype=float) / scale
+            exp_cum = np.asarray(fc["exp_cum"], dtype=float) / scale
             axc.plot(fx, lin_cum, color="#1f77b4", linestyle="--", linewidth=1.3,
-                     label=f"线性外推 {fc['lin_total'] / 1e6:.2f}M", zorder=4)
+                     label=f"线性外推 {fc['lin_total'] / scale:,.2f}{unit}", zorder=4)
             axc.plot(fx, exp_cum, color="#2ca02c", linestyle=":", linewidth=1.4,
-                     label=f"指数外推 {fc['exp_total'] / 1e6:.2f}M", zorder=4)
+                     label=f"指数外推 {fc['exp_total'] / scale:,.2f}{unit}", zorder=4)
             axc.fill_between(fx, np.minimum(lin_cum, exp_cum), np.maximum(lin_cum, exp_cum),
                              color="#777777", alpha=0.15, zorder=2)
             dl = mdates.date2num(fc["deadline"])
             axc.axvline(dl, color="#444444", linestyle="-.", linewidth=1.1, zorder=3)
-            axc.annotate("截止 11-15 23:59", (dl, 0.02), xycoords=("data", "axes fraction"),
+            axc.annotate(f"截止 {fc['deadline']:%m-%d %H:%M}", (dl, 0.02),
+                         xycoords=("data", "axes fraction"),
                          fontsize=8, ha="right", va="bottom", rotation=90, color="#444444")
             nm = fc.get("next_milestone") or {}
             if nm.get("value") and nm.get("eta_lo") is not None:
-                axc.axhline(nm["value"], color="#4B0082", linestyle="--", linewidth=0.9, zorder=2)
-                axc.text(0.16, nm["value"],
-                         f"{nm['value'] / MILLION_STEP:.0f}M 预计 {nm['eta_lo']:%m-%d}~{nm['eta_hi']:%m-%d}",
+                axc.axhline(nm["value"] / scale, color="#4B0082", linestyle="--",
+                            linewidth=0.9, zorder=2)
+                axc.text(0.16, nm["value"] / scale,
+                         f"{self.step_amount(nm['value'])} 预计 {nm['eta_lo']:%m-%d}~{nm['eta_hi']:%m-%d}",
                          transform=axc.get_yaxis_transform(), ha="left", va="bottom",
                          fontsize=8, color="#4B0082")
             xlim = (float(mdates.date2num(cum_ts[0])), mdates.date2num(fc["deadline"]) + 0.5)
@@ -2137,15 +2247,16 @@ class AnalyzeChart(BaseChart):
             axc.text(0.02, 0.97, f"未外推: {fc['reason']}", transform=axc.transAxes,
                      fontsize=9, color="#777777", va="top")
             xlim = self.window_xlim()
-        axc.set_ylabel("累计金额(元)", fontsize=10, color="red")
-        axc.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_money))
+        axc.set_ylabel(f"累计金额({unit})", fontsize=10, color="red")
+        money_fmt = _fmt_money if scale == 1.0 else (lambda v, _: f"{v:,.2f}")
+        axc.yaxis.set_major_formatter(mticker.FuncFormatter(money_fmt))
         axc.tick_params(axis="y", labelcolor="red")
         axc.set_title("累计金额与终局外推", fontsize=12, fontweight="bold")
         axc.grid(True, linestyle="--", alpha=0.35)
         axc.set_xlabel("时间", fontsize=11)
         axc.legend(loc="upper left", fontsize=8)
         self._apply_time_axis(axc, xlim)
-        self.attach_time_status(axc, " 元")
+        self.attach_time_status(axc, f" {unit}")
 
         def provider(i):
             prev = cum_money[i - 1] if i else cum_money[i]

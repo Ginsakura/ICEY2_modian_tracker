@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "defaults": {
+    "interval": 60,
+    "project": "icey2"
+  },
+  "projects": {
+    "icey2": {
+      "url": "https://zhongchou.modian.com/item/160465.html",
+      "data_file": "data/icey2.csv",
+      "interval": 60,
+      "enabled": true,
+      "collect_until": "2026-11-16 00:00",
+      "campaign": {
+        "deadline": "2026-11-15 23:59",
+        "start": "2026-10-05 22:00",
+        "phases": [
+          { "name": "P1 起势", "start": "2026-10-05", "end": "2026-10-08" },
+          { "name": "P2 退坡", "start": "2026-10-08", "end": "2026-10-15" },
+          { "name": "P3 二次脉冲", "start": "2026-10-15", "end": "2026-10-18" },
+          { "name": "P4 断崖", "start": "2026-10-18", "end": "2026-10-23" },
+          { "name": "P5 长尾", "start": "2026-10-23", "end": "2026-11-16" }
+        ]
+      }
+    },
+    "linglan": {
+      "url": "https://zhongchou.modian.com/item/160539.html",
+      "data_file": "data/linglan.csv",
+      "interval": 300,
+      "enabled": true,
+      "collect_from": "2026-11-15 00:00",
+      "collect_until": "2027-01-10 12:00",
+      "campaign": {
+        "deadline": "2027-01-10 12:00"
+      }
+    }
+  }
+}

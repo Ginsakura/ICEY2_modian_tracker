@@ -20,14 +20,16 @@ import charts  # noqa: E402
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="渲染十个分析视图为 PNG")
-    ap.add_argument("--csv", default="data.csv")
+    ap.add_argument("--config", default=None, help="配置文件路径；缺省用仓库根 trackers.json")
+    ap.add_argument("--csv", default=None, help="CSV 路径；缺省用项目 data_file")
+    ap.add_argument("--project", default=None, help="项目名；缺省用 defaults.project")
     ap.add_argument("--out", default=".preview")
     ap.add_argument("--window", default="", help="时间窗口索引 lo,hi；缺省为全窗口")
     ap.add_argument("--dpi", type=int, default=90)
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
-    ch = charts.AnalyzeChart(args.csv)
+    ch = charts.AnalyzeChart(csv_file=args.csv, project=args.project, config_path=args.config)
     # 无头模式不需要轮询与重绘节流
     ch._render_timer.stop()
     ch._poll_timer.stop()

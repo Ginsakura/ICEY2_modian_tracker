@@ -7,7 +7,7 @@
 
 用法(Windows venv):
     .venv/Scripts/python.exe scripts/verify_views.py
-    .venv/Scripts/python.exe scripts/verify_views.py --csv data.csv --out /tmp/verify_views
+    .venv/Scripts/python.exe scripts/verify_views.py --csv data/icey2.csv --out /tmp/verify_views
 """
 import argparse
 import csv
@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import charts  # noqa: E402
 import modian_tracker as mt  # noqa: E402
+from tier_columns import FREE_COLUMN, Tier, parse_price  # noqa: E402
 
 PASS: list[str] = []
 FAIL: list[str] = []
@@ -41,9 +42,9 @@ def _bad(msg: str) -> None:
     print(f"FAIL {msg}")
 
 
-def _render_all(csv_path: str, out_dir: str) -> tuple[bool, int]:
+def _render_all(csv_path: str, out_dir: str, project: str | None = None) -> tuple[bool, int]:
     os.makedirs(out_dir, exist_ok=True)
-    ch = charts.AnalyzeChart(csv_path)
+    ch = charts.AnalyzeChart(csv_file=csv_path, project=project)
     ch._render_timer.stop()
     ch._poll_timer.stop()
     try:
@@ -56,7 +57,28 @@ def _render_all(csv_path: str, out_dir: str) -> tuple[bool, int]:
         plt.close(ch.fig)
 
 
-def check_truncated(csv_path: str, tmp: str) -> None:
+def check_tier_order() -> None:
+    """3.5 档位序列：按价格升序，同价按 Lv 序号；缺价格列排在付费列之后。"""
+    header = [
+        "timestamp", "总人数", "总金额", "Lv.2 乙（￥21）", "Lv1（￥42）",
+        "无偿支持", "Lv.3 丙（￥17）", "Lv.1 甲（￥17）", "Lv.9 缺价",
+    ]
+    stub = charts.BaseChart.__new__(charts.BaseChart)
+    stub.header = header
+    cols = charts.BaseChart.lv_cols(stub)
+    prices = charts.BaseChart.tier_prices(stub)
+    expected_cols = ["Lv.1 甲（￥17）", "Lv.3 丙（￥17）", "Lv.2 乙（￥21）", "Lv1（￥42）", "Lv.9 缺价"]
+    expected_prices = [
+        ("Lv.1 甲（￥17）", 17.0), ("Lv.3 丙（￥17）", 17.0),
+        ("Lv.2 乙（￥21）", 21.0), ("Lv1（￥42）", 42.0),
+    ]
+    if cols == expected_cols and prices == expected_prices:
+        _ok("3.5 档位排序: 价格升序、同价按 Lv、缺价列靠后")
+    else:
+        _bad(f"3.5 档位排序异常: cols={cols}, prices={prices}")
+
+
+def check_truncated(csv_path: str, tmp: str, project: str | None = None) -> None:
     with open(csv_path, "rb") as f:
         raw = f.read()
     cases = (
@@ -69,7 +91,7 @@ def check_truncated(csv_path: str, tmp: str) -> None:
             f.write(raw)
             f.write(tail)
         try:
-            ok, n = _render_all(path, os.path.join(tmp, "out_" + label))
+            ok, n = _render_all(path, os.path.join(tmp, "out_" + label), project)
         except Exception as exc:  # noqa: BLE001 验证脚本要一次跑完并列出全部失败
             _bad(f"4.4 {label}: 渲染抛异常 {type(exc).__name__}: {exc}")
             continue
@@ -92,28 +114,35 @@ def _fixture(path: str, header: list[str], rows: int, step: int = 10) -> None:
             f.write(_row(t0 + timedelta(seconds=step * i), i).encode("utf-8"))
 
 
-def _append_batch(path: str, data: dict, count: int) -> list[float]:
+def _tiers_from_header(header: list[str]) -> list[Tier]:
+    tiers: list[Tier] = []
+    for col in header[3:]:
+        if col == FREE_COLUMN:
+            tiers.append(Tier(None, None, FREE_COLUMN, 1, True))
+            continue
+        price = parse_price(col)
+        if price is not None:
+            tiers.append(Tier(str(price), price, "", 1, False))
+    return tiers
+
+
+def _append_batch(path: str, tiers: list[Tier], count: int) -> list[float]:
     times: list[float] = []
     for i in range(count):
         t = time.perf_counter()
-        mt.append_to_csv(data, 1000 + i, 50000.0 + i)
+        mt.append_tiers(tiers, 1000 + i, 50000.0 + i, path)
         times.append((time.perf_counter() - t) * 1000)
     return times
 
 
 def check_dense(tmp: str, header: list[str]) -> None:
-    data = {c: 1 for c in header[3:]}
+    tiers = _tiers_from_header(header)
     for rows in (500, 5000):
         path = os.path.join(tmp, f"dense_{rows}.csv")
         _fixture(path, header, rows)
-        old_file = mt.CSV_FILE
-        mt.CSV_FILE = path
-        try:
-            before = os.path.getsize(path)
-            times = _append_batch(path, data, 100)
-            after = os.path.getsize(path)
-        finally:
-            mt.CSV_FILE = old_file
+        before = os.path.getsize(path)
+        times = _append_batch(path, tiers, 100)
+        after = os.path.getsize(path)
         head = statistics.median(times[:20])
         tail = statistics.median(times[-20:])
         grew = after - before
@@ -131,7 +160,8 @@ def check_dense(tmp: str, header: list[str]) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="验证截断行兼容与高密度追加")
-    ap.add_argument("--csv", default="data.csv")
+    ap.add_argument("--csv", default="data/icey2.csv")
+    ap.add_argument("--project", default=None, help="项目名；缺省用 defaults.project")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -142,7 +172,8 @@ def main() -> int:
     print(f"临时目录: {tmp}")
     print(f"表头: {','.join(header)}")
 
-    check_truncated(args.csv, tmp)
+    check_tier_order()
+    check_truncated(args.csv, tmp, args.project)
     check_dense(tmp, header)
     print(f"\n{len(PASS)} PASS / {len(FAIL)} FAIL")
     return 0 if not FAIL else 1
