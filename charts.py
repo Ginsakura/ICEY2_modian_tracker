@@ -58,6 +58,8 @@ class ChartContext:
 
 
 NICE_STEPS: tuple[float, ...] = (1.0, 2.0, 2.5, 5.0)
+MILESTONE_MIN_STEP: int = 1_000
+MILESTONE_TIER_FACTOR: int = 5
 
 
 def _nice_step(value: float) -> int:
@@ -74,11 +76,21 @@ def _nice_step(value: float) -> int:
     return min(candidates, key=lambda c: (abs(c - value), c))
 
 
-def choose_milestone_step(max_money: float) -> int:
-    """按总金额的 1/40 选取里程碑步长；icey2 约 1M、linglan 约 100 元。"""
+def choose_milestone_step(max_money: float, max_tier_price: float = 0.0) -> int:
+    """按数据选择小步长；主步长由调用方取 10 倍（1K/10K、1M/10M）。
+
+    目标步长取以下三者最大：
+    - 总金额的 1/40（约 40 条里程碑）；
+    - 绝对下限 1,000 元，避免小额项目切出 100 元碎步；
+    - 5 个最高付费档的价格，避免高客单项目一单跨过一格。
+    结果再取最接近的 {1,2,2.5,5}×10^n；无有效金额时退回下限。
+    """
     if not math.isfinite(max_money) or max_money <= 0:
-        return 1
-    return _nice_step(max_money / 40.0)
+        return MILESTONE_MIN_STEP
+    target = max(max_money / 40.0, float(MILESTONE_MIN_STEP))
+    if math.isfinite(max_tier_price) and max_tier_price > 0:
+        target = max(target, max_tier_price * MILESTONE_TIER_FACTOR)
+    return max(MILESTONE_MIN_STEP, _nice_step(target))
 
 
 def choose_money_unit(max_money: float) -> tuple[float, str]:
@@ -393,7 +405,10 @@ class BaseChart:
             self.mtime = None
         valid_money = [v for v in self.col_values("总金额") if not math.isnan(v)]
         self.max_money = max(valid_money) if valid_money else 0.0
-        self.milestone_step = self.context.milestone_step or choose_milestone_step(self.max_money)
+        max_tier_price = max((price for _, price in self.tier_prices()), default=0.0)
+        self.milestone_step = self.context.milestone_step or choose_milestone_step(
+            self.max_money, max_tier_price,
+        )
         self.money_scale, self.money_unit = choose_money_unit(self.max_money)
         return True
 
@@ -1845,7 +1860,13 @@ class AnalyzeChart(BaseChart):
     def _draw_milestone_view(self) -> None:
         marks = self.milestones()
         if not marks:
-            self._notice("未找到可用的金额数据，无法计算里程碑节奏。")
+            if self.max_money <= 0:
+                self._notice("未找到可用的金额数据，无法计算里程碑节奏。")
+            else:
+                self._notice(
+                    f"累计金额 {self.short_amount(self.max_money)} 尚未跨过首个 "
+                    f"{self.step_amount(self.milestone_step)} 里程碑。"
+                )
             return
         rect = (self.plot_l(), self.plot_b(), self.PLOT_R - self.plot_l(), self.PLOT_T - self.plot_b())
         ax = self.fig.add_axes(rect)
